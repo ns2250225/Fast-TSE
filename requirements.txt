@@ -1,0 +1,8 @@
+torchaudio
+soundfile
+numpy<2.0
+speechbrain
+torch
+fastapi
+uvicorn
+python-multipart
