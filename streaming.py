@@ -19,7 +19,7 @@ target_speaker_embedding = speaker_rec.encode_file(target_audio_path).to(DEVICE)
 
 # 初始化分离模型并加载到GPU
 print("加载说话人分离模型...")
-separator_model = separator.from_hparams(source="speechbrain/sepformer-libri-960h", savedir="tmpdir_separation").to(DEVICE)
+separator_model = separator.from_hparams(source="speechbrain/sepformer-wsj03mix", savedir="tmpdir_separation").to(DEVICE)
 
 # 设置麦克风参数
 FORMAT = pyaudio.paInt16
