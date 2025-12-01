@@ -299,3 +299,8 @@ async def separate_match_wav(
         "Content-Disposition": "attachment; filename=matched_best.wav",
     }
     return Response(content=wav_b, media_type="application/octet-stream", headers=headers)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
