@@ -1,4 +1,4 @@
-torchaudio
+torchaudio==2.8.0
 soundfile
 numpy<2.0
 speechbrain
