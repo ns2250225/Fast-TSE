@@ -112,7 +112,7 @@ SEP_SR = 16000
 CLS_SR = 16000
 MAIN_DEVICE = "cpu"
 MATCH_DEVICE = "cpu"
-MATCH_THRESHOLD = 0.8
+MATCH_THRESHOLD = 0.25
 
 
 @asynccontextmanager
@@ -252,14 +252,12 @@ async def separate_match(
     best_idx, sims, t_match = _match_best(sources, SEP_SR, _resample_np(tgt_y, tgt_sr, SEP_SR))
     
     if best_idx is None:
-        wav_b = _wav_bytes(torch.zeros(sources.shape[1]), SEP_SR)
-        matched_idx = -1
-        similarity = max(sims) if len(sims) > 0 else 0.0
-    else:
-        best_audio = sources[best_idx]
-        wav_b = _wav_bytes(best_audio, SEP_SR)
-        matched_idx = best_idx + 1
-        similarity = sims[best_idx]
+        return JSONResponse(content={"code": -1, "message": "没有目标人声音"})
+
+    best_audio = sources[best_idx]
+    wav_b = _wav_bytes(best_audio, SEP_SR)
+    matched_idx = best_idx + 1
+    similarity = sims[best_idx]
 
     t_total_end = time.time()
     return JSONResponse(
@@ -300,14 +298,12 @@ async def separate_match_wav(
     best_idx, sims, t_match = _match_best(sources, SEP_SR, _resample_np(tgt_y, tgt_sr, SEP_SR))
     
     if best_idx is None:
-        wav_b = _wav_bytes(torch.zeros(sources.shape[1]), SEP_SR)
-        matched_idx = -1
-        similarity = max(sims) if len(sims) > 0 else 0.0
-    else:
-        best_audio = sources[best_idx]
-        wav_b = _wav_bytes(best_audio, SEP_SR)
-        matched_idx = best_idx + 1
-        similarity = sims[best_idx]
+        return JSONResponse(content={"code": -1, "message": "没有目标人声音"})
+
+    best_audio = sources[best_idx]
+    wav_b = _wav_bytes(best_audio, SEP_SR)
+    matched_idx = best_idx + 1
+    similarity = sims[best_idx]
 
     t_total_end = time.time()
     headers = {
