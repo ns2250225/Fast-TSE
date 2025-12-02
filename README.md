@@ -75,7 +75,7 @@ uvicorn api:app --host 0.0.0.0 --port 8000
   - 分离模型：`speechbrain/sepformer-wsj02mix`、`speechbrain/sepformer-wsj03mix`
   - 说话人分类器：`speechbrain/spkrec-ecapa-voxceleb`
 - 自动选择设备（GPU/CPU）并记录预加载耗时
-- **注意**：系统预设匹配相似度阈值为 `0.8`。若所有分离出的音频与目标音频的相似度均不高于 0.8，则视为未找到目标人。
+- **注意**：系统默认匹配相似度阈值为 `0.25`。若所有分离出的音频与目标音频的相似度均不高于该阈值，则视为未找到目标人。可通过接口参数 `match_threshold` 自定义此阈值。
 
 ### JSON 端点
 `POST /separate-match`
@@ -85,6 +85,7 @@ uvicorn api:app --host 0.0.0.0 --port 8000
   - `target`：目标人音频文件
   - `num_speakers`：说话人数（默认 2）
   - `normalize`：是否归一化（默认 true）
+  - `match_threshold`：匹配相似度阈值（默认 0.25）
 
 示例：
 
@@ -93,6 +94,7 @@ curl -X POST \
   -F "mixed=@mixed.wav" \
   -F "target=@target.wav" \
   -F "num_speakers=2" \
+  -F "match_threshold=0.25" \
   http://localhost:8000/separate-match
 ```
 
@@ -103,7 +105,7 @@ curl -X POST \
   - `audio_wav_base64`：最匹配音频的 WAV Base64
   - `timings`：预加载、分离、匹配计算、总耗时
   - `device`：分离与匹配所用设备
-- 未找到匹配（相似度 <= 0.8）：
+- 未找到匹配（相似度 <= match_threshold）：
   - `code`: -1
   - `message`: "没有目标人声音"
 
@@ -120,7 +122,7 @@ curl -X POST \
     - `X-Total-Time-Sec`
     - `X-Device-Separation`
     - `X-Device-Match`
-  - 未找到匹配（相似度 <= 0.8）：返回 JSON `{"code": -1, "message": "没有目标人声音"}`，Content-Type 为 `application/json`。
+  - 未找到匹配（相似度 <= match_threshold）：返回 JSON `{"code": -1, "message": "没有目标人声音"}`，Content-Type 为 `application/json`。
 
 示例下载：
 
@@ -129,6 +131,7 @@ curl -X POST \
   -F "mixed=@mixed.wav" \
   -F "target=@target.wav" \
   -F "num_speakers=2" \
+  -F "match_threshold=0.25" \
   http://localhost:8000/separate-match-wav -o best.wav
 ```
 

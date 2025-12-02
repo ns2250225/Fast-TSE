@@ -105,7 +105,6 @@ SEP_SR = 16000
 CLS_SR = 16000
 MAIN_DEVICE = "cpu"
 MATCH_DEVICE = "cpu"
-MATCH_THRESHOLD = 0.25
 
 
 @asynccontextmanager
@@ -196,7 +195,7 @@ def _separate(yb, num_speakers, normalize=True):
     return sources, order, t_sep_end - t_sep_start
 
 
-def _match_best(sources, sr, tgt_y):
+def _match_best(sources, sr, tgt_y, threshold):
     t_match_compute_start = time.time()
     tgt_y_t = torch.tensor(_resample_np(tgt_y, sr, CLS_SR)).unsqueeze(0).to(MATCH_DEVICE)
     with torch.no_grad():
@@ -213,7 +212,7 @@ def _match_best(sources, sr, tgt_y):
         sims.append(float(s.item()))
     best_idx = int(max(range(len(sims)), key=lambda k: sims[k])) if len(sims) > 0 else 0
     # Check threshold
-    if len(sims) > 0 and sims[best_idx] <= MATCH_THRESHOLD:
+    if len(sims) > 0 and sims[best_idx] <= threshold:
         best_idx = None
     t_match_compute_end = time.time()
     return best_idx, sims, t_match_compute_end - t_match_compute_start
@@ -225,6 +224,7 @@ async def separate_match(
     target: UploadFile = File(...),
     num_speakers: int = Form(2),
     normalize: bool = Form(True),
+    match_threshold: float = Form(0.25),
 ):
     t_total_start = time.time()
     mixed_bytes = await mixed.read()
@@ -234,7 +234,7 @@ async def separate_match(
     mix_rs = _resample_np(mix_y, mix_sr, SEP_SR)
     x = torch.tensor(mix_rs).unsqueeze(0).to(MAIN_DEVICE)
     sources, order, t_sep = _separate(x, num_speakers, normalize=normalize)
-    best_idx, sims, t_match = _match_best(sources, SEP_SR, _resample_np(tgt_y, tgt_sr, SEP_SR))
+    best_idx, sims, t_match = _match_best(sources, SEP_SR, _resample_np(tgt_y, tgt_sr, SEP_SR), match_threshold)
     
     if best_idx is None:
         return JSONResponse(content={"code": -1, "message": "没有目标人声音"})
@@ -270,6 +270,7 @@ async def separate_match_wav(
     target: UploadFile = File(...),
     num_speakers: int = Form(2),
     normalize: bool = Form(True),
+    match_threshold: float = Form(0.25),
 ):
     t_total_start = time.time()
     mixed_bytes = await mixed.read()
@@ -279,7 +280,7 @@ async def separate_match_wav(
     mix_rs = _resample_np(mix_y, mix_sr, SEP_SR)
     x = torch.tensor(mix_rs).unsqueeze(0).to(MAIN_DEVICE)
     sources, order, t_sep = _separate(x, num_speakers, normalize=normalize)
-    best_idx, sims, t_match = _match_best(sources, SEP_SR, _resample_np(tgt_y, tgt_sr, SEP_SR))
+    best_idx, sims, t_match = _match_best(sources, SEP_SR, _resample_np(tgt_y, tgt_sr, SEP_SR), match_threshold)
     
     if best_idx is None:
         return JSONResponse(content={"code": -1, "message": "没有目标人声音"})
