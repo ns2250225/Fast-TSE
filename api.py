@@ -3,16 +3,22 @@ import io
 import time
 import math
 import base64
+import wave
 from typing import Optional
+from contextlib import asynccontextmanager
 
+import torch
+import torchaudio
+import numpy as np
+import soundfile as sf
+import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse, Response
-from contextlib import asynccontextmanager
+from speechbrain.pretrained import SepformerSeparation, EncoderClassifier
 
 
 def _is_torch_tensor(x):
     try:
-        import torch
         return isinstance(x, torch.Tensor)
     except Exception:
         return False
@@ -20,8 +26,6 @@ def _is_torch_tensor(x):
 
 def _load_audio_mono_bytes(b):
     try:
-        import soundfile as sf
-        import numpy as np
         y, sr = sf.read(io.BytesIO(b))
         if y.ndim == 2:
             y = y.mean(axis=1)
@@ -30,8 +34,6 @@ def _load_audio_mono_bytes(b):
     except Exception:
         pass
     try:
-        import torchaudio
-        import torch
         y, sr = torchaudio.load(io.BytesIO(b))
         if y.shape[0] > 1:
             y = y.mean(dim=0)
@@ -45,7 +47,6 @@ def _load_audio_mono_bytes(b):
 def _resample_np(y, sr_from, sr_to):
     if sr_from == sr_to:
         return y
-    import numpy as np
     ratio = float(sr_to) / float(sr_from)
     new_len = int(math.floor(len(y) * ratio))
     x_old = np.linspace(0.0, 1.0, num=len(y), endpoint=False)
@@ -58,10 +59,8 @@ def _resample_torch(y_t, sr_from, sr_to):
     if sr_from == sr_to:
         return y_t
     try:
-        import torchaudio
         return torchaudio.functional.resample(y_t, sr_from, sr_to)
     except Exception:
-        import torch
         y_np = y_t.detach().cpu().numpy()
         y_np = _resample_np(y_np, sr_from, sr_to)
         return torch.tensor(y_np).unsqueeze(0)
@@ -69,8 +68,6 @@ def _resample_torch(y_t, sr_from, sr_to):
 
 def _wav_bytes(y, sr):
     try:
-        import soundfile as sf
-        import numpy as np
         y_np = y.detach().cpu().numpy() if _is_torch_tensor(y) else y
         bio = io.BytesIO()
         sf.write(bio, y_np.astype(np.float32), sr, format="WAV")
@@ -78,16 +75,12 @@ def _wav_bytes(y, sr):
     except Exception:
         pass
     try:
-        import torch
-        import torchaudio
         bio = io.BytesIO()
         y_t = y.detach().cpu().unsqueeze(0) if _is_torch_tensor(y) else torch.tensor(y).unsqueeze(0)
         torchaudio.save(bio, y_t, sr, format="wav")
         return bio.getvalue()
     except Exception:
         pass
-    import numpy as np
-    import wave
     y_np = y.detach().cpu().numpy() if _is_torch_tensor(y) else y
     y_np = np.clip(y_np, -1.0, 1.0)
     y_i16 = (y_np * 32767.0).astype(np.int16)
@@ -118,8 +111,6 @@ MATCH_THRESHOLD = 0.25
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global SEP_MODELS, CLS, PRELOAD_TIMES, SEP_SR, CLS_SR, MAIN_DEVICE, MATCH_DEVICE
-    import torch
-    from speechbrain.pretrained import SepformerSeparation, EncoderClassifier
     MAIN_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     MATCH_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     t0 = time.time()
@@ -158,11 +149,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-
-
 def _separate(yb, num_speakers, normalize=True):
-    import torch
-    import numpy as np
     model = SEP_MODELS.get(str(num_speakers))
     if model is None:
         raise RuntimeError("模型未加载")
@@ -210,7 +197,6 @@ def _separate(yb, num_speakers, normalize=True):
 
 
 def _match_best(sources, sr, tgt_y):
-    import torch
     t_match_compute_start = time.time()
     tgt_y_t = torch.tensor(_resample_np(tgt_y, sr, CLS_SR)).unsqueeze(0).to(MATCH_DEVICE)
     with torch.no_grad():
@@ -245,7 +231,6 @@ async def separate_match(
     target_bytes = await target.read()
     mix_y, mix_sr = _load_audio_mono_bytes(mixed_bytes)
     tgt_y, tgt_sr = _load_audio_mono_bytes(target_bytes)
-    import torch
     mix_rs = _resample_np(mix_y, mix_sr, SEP_SR)
     x = torch.tensor(mix_rs).unsqueeze(0).to(MAIN_DEVICE)
     sources, order, t_sep = _separate(x, num_speakers, normalize=normalize)
@@ -291,7 +276,6 @@ async def separate_match_wav(
     target_bytes = await target.read()
     mix_y, mix_sr = _load_audio_mono_bytes(mixed_bytes)
     tgt_y, tgt_sr = _load_audio_mono_bytes(target_bytes)
-    import torch
     mix_rs = _resample_np(mix_y, mix_sr, SEP_SR)
     x = torch.tensor(mix_rs).unsqueeze(0).to(MAIN_DEVICE)
     sources, order, t_sep = _separate(x, num_speakers, normalize=normalize)
@@ -320,5 +304,4 @@ async def separate_match_wav(
 
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
