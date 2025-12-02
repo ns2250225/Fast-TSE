@@ -63,6 +63,10 @@ python sp.py mixed.wav -n 2 -t target.wav --device cpu
 启动：
 
 ```bash
+# 方式一：直接运行脚本
+python api.py
+
+# 方式二：使用 uvicorn 命令
 uvicorn api:app --host 0.0.0.0 --port 8000
 ```
 
@@ -71,6 +75,7 @@ uvicorn api:app --host 0.0.0.0 --port 8000
   - 分离模型：`speechbrain/sepformer-wsj02mix`、`speechbrain/sepformer-wsj03mix`
   - 说话人分类器：`speechbrain/spkrec-ecapa-voxceleb`
 - 自动选择设备（GPU/CPU）并记录预加载耗时
+- **注意**：系统预设匹配相似度阈值为 `0.8`。若所有分离出的音频与目标音频的相似度均不高于 0.8，则视为未找到目标人。
 
 ### JSON 端点
 `POST /separate-match`
@@ -92,25 +97,30 @@ curl -X POST \
 ```
 
 返回 JSON：
-- `matched_speaker_index`：最匹配说话人序号（从 1 开始）
-- `similarity`：余弦相似度分数
-- `audio_wav_base64`：最匹配音频的 WAV Base64
-- `timings`：预加载、分离、匹配计算、总耗时
-- `device`：分离与匹配所用设备
+- 成功匹配：
+  - `matched_speaker_index`：最匹配说话人序号（从 1 开始）
+  - `similarity`：余弦相似度分数
+  - `audio_wav_base64`：最匹配音频的 WAV Base64
+  - `timings`：预加载、分离、匹配计算、总耗时
+  - `device`：分离与匹配所用设备
+- 未找到匹配（相似度 <= 0.8）：
+  - `code`: -1
+  - `message`: "没有目标人声音"
 
 ### 字节流端点
 `POST /separate-match-wav`
 - `multipart/form-data`
 - 字段与 JSON 端点一致
-- 响应：`application/octet-stream`，直接返回 WAV 字节
-- 响应头包含元数据：
-  - `X-Matched-Speaker-Index`
-  - `X-Similarity`
-  - `X-Separation-Time-Sec`
-  - `X-Match-Compute-Time-Sec`
-  - `X-Total-Time-Sec`
-  - `X-Device-Separation`
-  - `X-Device-Match`
+- 响应：
+  - 成功匹配：`application/octet-stream`，直接返回 WAV 字节。响应头包含元数据：
+    - `X-Matched-Speaker-Index`
+    - `X-Similarity`
+    - `X-Separation-Time-Sec`
+    - `X-Match-Compute-Time-Sec`
+    - `X-Total-Time-Sec`
+    - `X-Device-Separation`
+    - `X-Device-Match`
+  - 未找到匹配（相似度 <= 0.8）：返回 JSON `{"code": -1, "message": "没有目标人声音"}`，Content-Type 为 `application/json`。
 
 示例下载：
 
