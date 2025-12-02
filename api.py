@@ -112,7 +112,6 @@ SEP_SR = 16000
 CLS_SR = 16000
 MAIN_DEVICE = "cpu"
 MATCH_DEVICE = "cpu"
-MATCH_THRESHOLD = 0.8
 
 
 @asynccontextmanager
@@ -226,11 +225,6 @@ def _match_best(sources, sr, tgt_y):
         s = torch.dot(emb, tgt_emb) / d
         sims.append(float(s.item()))
     best_idx = int(max(range(len(sims)), key=lambda k: sims[k])) if len(sims) > 0 else 0
-    
-    # Check threshold
-    if len(sims) > 0 and sims[best_idx] < MATCH_THRESHOLD:
-        best_idx = None
-
     t_match_compute_end = time.time()
     return best_idx, sims, t_match_compute_end - t_match_compute_start
 
@@ -252,23 +246,13 @@ async def separate_match(
     x = torch.tensor(mix_rs).unsqueeze(0).to(MAIN_DEVICE)
     sources, order, t_sep = _separate(x, num_speakers, normalize=normalize)
     best_idx, sims, t_match = _match_best(sources, SEP_SR, _resample_np(tgt_y, tgt_sr, SEP_SR))
-    
-    if best_idx is None:
-        # Return silent audio if no match found
-        wav_b = _wav_bytes(torch.zeros(sources.shape[1]), SEP_SR)
-        matched_idx = -1
-        similarity = max(sims) if len(sims) > 0 else 0.0
-    else:
-        best_audio = sources[best_idx]
-        wav_b = _wav_bytes(best_audio, SEP_SR)
-        matched_idx = best_idx + 1
-        similarity = sims[best_idx]
-
+    best_audio = sources[best_idx]
+    wav_b = _wav_bytes(best_audio, SEP_SR)
     t_total_end = time.time()
     return JSONResponse(
         content={
-            "matched_speaker_index": matched_idx,
-            "similarity": similarity,
+            "matched_speaker_index": best_idx + 1,
+            "similarity": sims[best_idx] if len(sims) > 0 else 0.0,
             "audio_wav_base64": base64.b64encode(wav_b).decode("ascii"),
             "timings": {
                 "preload": PRELOAD_TIMES,
@@ -301,22 +285,12 @@ async def separate_match_wav(
     x = torch.tensor(mix_rs).unsqueeze(0).to(MAIN_DEVICE)
     sources, order, t_sep = _separate(x, num_speakers, normalize=normalize)
     best_idx, sims, t_match = _match_best(sources, SEP_SR, _resample_np(tgt_y, tgt_sr, SEP_SR))
-    
-    if best_idx is None:
-        # Return silent audio if no match found
-        wav_b = _wav_bytes(torch.zeros(sources.shape[1]), SEP_SR)
-        matched_idx = -1
-        similarity = max(sims) if len(sims) > 0 else 0.0
-    else:
-        best_audio = sources[best_idx]
-        wav_b = _wav_bytes(best_audio, SEP_SR)
-        matched_idx = best_idx + 1
-        similarity = sims[best_idx]
-
+    best_audio = sources[best_idx]
+    wav_b = _wav_bytes(best_audio, SEP_SR)
     t_total_end = time.time()
     headers = {
-        "X-Matched-Speaker-Index": str(matched_idx),
-        "X-Similarity": str(similarity),
+        "X-Matched-Speaker-Index": str(best_idx + 1),
+        "X-Similarity": str(sims[best_idx] if len(sims) > 0 else 0.0),
         "X-Separation-Time-Sec": str(round(t_sep, 6)),
         "X-Match-Compute-Time-Sec": str(round(t_match, 6)),
         "X-Total-Time-Sec": str(round(t_total_end - t_total_start, 6)),
