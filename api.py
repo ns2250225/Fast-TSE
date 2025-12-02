@@ -112,6 +112,7 @@ SEP_SR = 16000
 CLS_SR = 16000
 MAIN_DEVICE = "cpu"
 MATCH_DEVICE = "cpu"
+MATCH_THRESHOLD = 0.8
 
 
 @asynccontextmanager
@@ -227,7 +228,7 @@ def _match_best(sources, sr, tgt_y):
     best_idx = int(max(range(len(sims)), key=lambda k: sims[k])) if len(sims) > 0 else 0
     
     # Check threshold
-    if len(sims) > 0 and sims[best_idx] < 0.8:
+    if len(sims) > 0 and sims[best_idx] < MATCH_THRESHOLD:
         best_idx = None
 
     t_match_compute_end = time.time()
@@ -253,7 +254,8 @@ async def separate_match(
     best_idx, sims, t_match = _match_best(sources, SEP_SR, _resample_np(tgt_y, tgt_sr, SEP_SR))
     
     if best_idx is None:
-        wav_b = b""
+        # Return silent audio if no match found
+        wav_b = _wav_bytes(torch.zeros(sources.shape[1]), SEP_SR)
         matched_idx = -1
         similarity = max(sims) if len(sims) > 0 else 0.0
     else:
@@ -301,7 +303,8 @@ async def separate_match_wav(
     best_idx, sims, t_match = _match_best(sources, SEP_SR, _resample_np(tgt_y, tgt_sr, SEP_SR))
     
     if best_idx is None:
-        wav_b = b""
+        # Return silent audio if no match found
+        wav_b = _wav_bytes(torch.zeros(sources.shape[1]), SEP_SR)
         matched_idx = -1
         similarity = max(sims) if len(sims) > 0 else 0.0
     else:
