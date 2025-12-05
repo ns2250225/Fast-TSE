@@ -10,6 +10,7 @@ from typing import Optional
 from contextlib import asynccontextmanager
 
 import torch
+import torch.nn.functional as F
 import torchaudio
 import numpy as np
 import soundfile as sf
@@ -115,8 +116,8 @@ SEP_SR = 16000
 CLS_SR = 16000
 MAIN_DEVICE = "cpu"
 MATCH_DEVICE = "cpu"
-ENABLE_ONNX = False
-FORCE_ONNX_CPU = False
+ENABLE_ONNX = True
+FORCE_ONNX_CPU = True
 ONNX_DIR = os.path.join(os.path.dirname(__file__), "onnx")
 
 
@@ -179,9 +180,13 @@ class OnnxSepformer:
         else:
             if FORCE_ONNX_CPU:
                 # 使用量化后的模型（如果存在）
-                # 假设量化模型与原模型在同一目录，后缀为 _int8.onnx
+                # 假设量化模型与原模型在同一目录，优先级：_static_int8.onnx > _int8.onnx
+                path_static_int8 = path.replace(".onnx", "_static_int8.onnx")
                 path_int8 = path.replace(".onnx", "_int8.onnx")
-                if os.path.exists(path_int8):
+                
+                if os.path.exists(path_static_int8):
+                    path = path_static_int8
+                elif os.path.exists(path_int8):
                     path = path_int8
                     
                 # CPU 优化配置
@@ -194,8 +199,12 @@ class OnnxSepformer:
                 # 允许使用 GPU (如果未强制 CPU) 但 device 参数为 "cpu" 的情况 (例如作为后备)
                 # 但通常 device 参数由调用者控制。如果调用者传入 "cpu"，我们尊重它。
                 # 不过，如果存在 int8 模型，我们也可以尝试加载它，因为 onnxruntime-gpu 也能运行 int8 模型
+                path_static_int8 = path.replace(".onnx", "_static_int8.onnx")
                 path_int8 = path.replace(".onnx", "_int8.onnx")
-                if os.path.exists(path_int8):
+                
+                if os.path.exists(path_static_int8):
+                    path = path_static_int8
+                elif os.path.exists(path_int8):
                     path = path_int8
                 self.sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"], sess_options=sess_options)
             
@@ -326,9 +335,13 @@ class OnnxClassifier:
         else:
             if FORCE_ONNX_CPU:
                 # 使用量化后的模型（如果存在）
-                # 假设量化模型与原模型在同一目录，后缀为 _int8.onnx
+                # 假设量化模型与原模型在同一目录，优先级：_static_int8.onnx > _int8.onnx
+                path_static_int8 = path.replace(".onnx", "_static_int8.onnx")
                 path_int8 = path.replace(".onnx", "_int8.onnx")
-                if os.path.exists(path_int8):
+                
+                if os.path.exists(path_static_int8):
+                    path = path_static_int8
+                elif os.path.exists(path_int8):
                     path = path_int8
                     
                 # CPU 优化配置
@@ -341,8 +354,12 @@ class OnnxClassifier:
                 # 允许使用 GPU (如果未强制 CPU) 但 device 参数为 "cpu" 的情况 (例如作为后备)
                 # 但通常 device 参数由调用者控制。如果调用者传入 "cpu"，我们尊重它。
                 # 不过，如果存在 int8 模型，我们也可以尝试加载它，因为 onnxruntime-gpu 也能运行 int8 模型
+                path_static_int8 = path.replace(".onnx", "_static_int8.onnx")
                 path_int8 = path.replace(".onnx", "_int8.onnx")
-                if os.path.exists(path_int8):
+                
+                if os.path.exists(path_static_int8):
+                    path = path_static_int8
+                elif os.path.exists(path_int8):
                     path = path_int8
                 self.sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"], sess_options=sess_options)
 
@@ -428,6 +445,41 @@ class OnnxClassifier:
             return out_tensor
 
 
+class SepformerWrapper(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.encoder = model.mods.encoder
+        self.masknet = model.mods.masknet
+        self.decoder = model.mods.decoder
+        self.num_spks = model.hparams.num_spks
+        
+    def forward(self, mix):
+        # Separation
+        mix_w = self.encoder(mix)
+        est_mask = self.masknet(mix_w)
+        mix_w = torch.stack([mix_w] * self.num_spks)
+        sep_h = mix_w * est_mask
+
+        # Decoding
+        est_source = torch.cat(
+            [
+                self.decoder(sep_h[i]).unsqueeze(-1)
+                for i in range(self.num_spks)
+            ],
+            dim=-1,
+        )
+
+        # T changed after conv1d in encoder, fix it here
+        T_origin = mix.size(1)
+        T_est = est_source.size(1)
+        if T_origin > T_est:
+            est_source = F.pad(est_source, (0, 0, 0, T_origin - T_est))   
+        else:
+            est_source = est_source[:, :T_origin, :]
+        
+        return est_source
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global SEP_MODELS, CLS, PRELOAD_TIMES, SEP_SR, CLS_SR, MAIN_DEVICE, MATCH_DEVICE
@@ -442,40 +494,37 @@ async def lifespan(app: FastAPI):
 
     if ENABLE_ONNX:
         sep2_path = os.path.join(ONNX_DIR, "sepformer_wsj02mix.onnx")
-        # Ensure model exists, otherwise export it
-        if not os.path.exists(sep2_path) and not os.path.exists(sep2_path.replace(".onnx", "_int8.onnx")) and not os.path.exists(sep2_path.replace(".onnx", "_fp16.onnx")):
-            print(f"Model {sep2_path} not found. Exporting from SpeechBrain...")
-            temp_model = SepformerSeparation.from_hparams(
-                source="speechbrain/sepformer-wsj02mix",
-                savedir=os.path.join("pretrained_models", "sepformer-wsj02mix"),
-                run_opts={"device": "cpu"},
-            )
-            os.makedirs(ONNX_DIR, exist_ok=True)
-            # Dummy input for export: [batch, time]
-            dummy_input = torch.randn(1, 16000)
-            torch.onnx.export(
-                temp_model.mods.encoder.model,
-                (dummy_input,),
-                sep2_path,
-                input_names=["mix"],
-                output_names=["est_sources"],
-                dynamic_axes={"mix": {0: "batch", 1: "time"}, "est_sources": {0: "batch", 2: "time"}},
-                opset_version=17
-            )
-            print(f"Exported {sep2_path}")
-            del temp_model
-            
         # Automatically use quantized/optimized model if available
-        # Priority: FP16 -> INT8 -> FP32
+        # Priority: FP16 -> Static INT8 -> INT8 -> FP32
         sep2_path_fp16 = sep2_path.replace(".onnx", "_fp16.onnx")
+        sep2_path_static_int8 = sep2_path.replace(".onnx", "_static_int8.onnx")
         sep2_path_int8 = sep2_path.replace(".onnx", "_int8.onnx")
         
+        final_path = None
         if os.path.exists(sep2_path_fp16):
-            sep2_path = sep2_path_fp16
+            final_path = sep2_path_fp16
+        elif os.path.exists(sep2_path_static_int8):
+            final_path = sep2_path_static_int8
         elif os.path.exists(sep2_path_int8):
-            sep2_path = sep2_path_int8
+            final_path = sep2_path_int8
+        elif os.path.exists(sep2_path):
+            final_path = sep2_path
             
-        SEP_MODELS["2"] = OnnxSepformer(sep2_path, sample_rate=8000, device=MAIN_DEVICE)
+        if final_path:
+            print(f"Loading ONNX model for sepformer_wsj02mix: {final_path}")
+            try:
+                SEP_MODELS["2"] = OnnxSepformer(final_path, sample_rate=8000, device=MAIN_DEVICE)
+            except Exception as e:
+                print(f"Failed to load ONNX model {final_path}: {e}")
+                final_path = None # Fallback
+        
+        if not final_path:
+            print("No valid ONNX model found for sepformer_wsj02mix, falling back to PyTorch.")
+            SEP_MODELS["2"] = SepformerSeparation.from_hparams(
+                source="speechbrain/sepformer-wsj02mix",
+                savedir=os.path.join("pretrained_models", "sepformer-wsj02mix"),
+                run_opts={"device": MAIN_DEVICE},
+            )
     else:
         SEP_MODELS["2"] = SepformerSeparation.from_hparams(
             source="speechbrain/sepformer-wsj02mix",
@@ -489,40 +538,37 @@ async def lifespan(app: FastAPI):
 
     if ENABLE_ONNX:
         sep3_path = os.path.join(ONNX_DIR, "sepformer_wsj03mix.onnx")
-        # Ensure model exists, otherwise export it
-        if not os.path.exists(sep3_path) and not os.path.exists(sep3_path.replace(".onnx", "_int8.onnx")) and not os.path.exists(sep3_path.replace(".onnx", "_fp16.onnx")):
-            print(f"Model {sep3_path} not found. Exporting from SpeechBrain...")
-            temp_model = SepformerSeparation.from_hparams(
-                source="speechbrain/sepformer-wsj03mix",
-                savedir=os.path.join("pretrained_models", "sepformer-wsj03mix"),
-                run_opts={"device": "cpu"},
-            )
-            os.makedirs(ONNX_DIR, exist_ok=True)
-            # Dummy input for export: [batch, time]
-            dummy_input = torch.randn(1, 16000)
-            torch.onnx.export(
-                temp_model.mods.encoder.model,
-                (dummy_input,),
-                sep3_path,
-                input_names=["mix"],
-                output_names=["est_sources"],
-                dynamic_axes={"mix": {0: "batch", 1: "time"}, "est_sources": {0: "batch", 2: "time"}},
-                opset_version=17
-            )
-            print(f"Exported {sep3_path}")
-            del temp_model
-            
         # Automatically use quantized/optimized model if available
-        # Priority: FP16 -> INT8 -> FP32
+        # Priority: FP16 -> Static INT8 -> INT8 -> FP32
         sep3_path_fp16 = sep3_path.replace(".onnx", "_fp16.onnx")
+        sep3_path_static_int8 = sep3_path.replace(".onnx", "_static_int8.onnx")
         sep3_path_int8 = sep3_path.replace(".onnx", "_int8.onnx")
         
+        final_path = None
         if os.path.exists(sep3_path_fp16):
-            sep3_path = sep3_path_fp16
+            final_path = sep3_path_fp16
+        elif os.path.exists(sep3_path_static_int8):
+            final_path = sep3_path_static_int8
         elif os.path.exists(sep3_path_int8):
-            sep3_path = sep3_path_int8
+            final_path = sep3_path_int8
+        elif os.path.exists(sep3_path):
+            final_path = sep3_path
             
-        SEP_MODELS["3"] = OnnxSepformer(sep3_path, sample_rate=8000, device=MAIN_DEVICE)
+        if final_path:
+            print(f"Loading ONNX model for sepformer_wsj03mix: {final_path}")
+            try:
+                SEP_MODELS["3"] = OnnxSepformer(final_path, sample_rate=8000, device=MAIN_DEVICE)
+            except Exception as e:
+                print(f"Failed to load ONNX model {final_path}: {e}")
+                final_path = None # Fallback
+
+        if not final_path:
+            print("No valid ONNX model found for sepformer_wsj03mix, falling back to PyTorch.")
+            SEP_MODELS["3"] = SepformerSeparation.from_hparams(
+                source="speechbrain/sepformer-wsj03mix",
+                savedir=os.path.join("pretrained_models", "sepformer-wsj03mix"),
+                run_opts={"device": MAIN_DEVICE},
+            )
     else:
         SEP_MODELS["3"] = SepformerSeparation.from_hparams(
             source="speechbrain/sepformer-wsj03mix",
@@ -533,51 +579,50 @@ async def lifespan(app: FastAPI):
     PRELOAD_TIMES["sepformer_3"] = time.time() - t1
     t2 = time.time()
 
-    if ENABLE_ONNX:
-        # Load a lightweight classifier just for feature extraction
-        sb_cls = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb",
-            savedir=os.path.join("pretrained_models", "spkrec-ecapa-voxceleb"),
-            run_opts={"device": "cpu"},
-        )
-        feature_extractor = sb_cls.mods.compute_features
-        cls_path = os.path.join(ONNX_DIR, "ecapa_voxceleb.onnx")
-        # Ensure model exists, otherwise export it
-        if not os.path.exists(cls_path) and not os.path.exists(cls_path.replace(".onnx", "_int8.onnx")) and not os.path.exists(cls_path.replace(".onnx", "_fp16.onnx")):
-            print(f"Model {cls_path} not found. Exporting from SpeechBrain...")
-            os.makedirs(ONNX_DIR, exist_ok=True)
-            # Dummy input for export: [batch, time, 80]
-            dummy_input = torch.randn(1, 100, 80)
-            # Use the feature_extractor logic to get embeddings from features
-            # Note: sb_cls.mods.embedding_model is the core ECAPA model
-            torch.onnx.export(
-                sb_cls.mods.embedding_model,
-                (dummy_input,),
-                cls_path,
-                input_names=["feats"],
-                output_names=["emb"],
-                dynamic_axes={"feats": {0: "batch", 1: "time"}, "emb": {0: "batch"}},
-                opset_version=17
-            )
-            print(f"Exported {cls_path}")
+    # Load PyTorch model first (needed for feature extraction anyway if using ONNX, or as fallback)
+    sb_cls = EncoderClassifier.from_hparams(
+        source="speechbrain/spkrec-ecapa-voxceleb",
+        savedir=os.path.join("pretrained_models", "spkrec-ecapa-voxceleb"),
+        run_opts={"device": "cpu" if ENABLE_ONNX else MATCH_DEVICE},
+    )
 
+    cls_loaded_onnx = False
+    if ENABLE_ONNX:
+        cls_path = os.path.join(ONNX_DIR, "ecapa_voxceleb.onnx")
         # Automatically use quantized/optimized model if available
-        # Priority: FP16 -> INT8 -> FP32
+        # Priority: FP16 -> Static INT8 -> INT8 -> FP32
         cls_path_fp16 = cls_path.replace(".onnx", "_fp16.onnx")
+        cls_path_static_int8 = cls_path.replace(".onnx", "_static_int8.onnx")
         cls_path_int8 = cls_path.replace(".onnx", "_int8.onnx")
         
+        final_path = None
         if os.path.exists(cls_path_fp16):
-            cls_path = cls_path_fp16
+            final_path = cls_path_fp16
+        elif os.path.exists(cls_path_static_int8):
+            final_path = cls_path_static_int8
         elif os.path.exists(cls_path_int8):
-            cls_path = cls_path_int8
+            final_path = cls_path_int8
+        elif os.path.exists(cls_path):
+            final_path = cls_path
             
-        CLS = OnnxClassifier(cls_path, feature_extractor, sample_rate=16000, device=MATCH_DEVICE)
+        if final_path:
+            print(f"Loading ONNX model for ecapa_voxceleb: {final_path}")
+            try:
+                feature_extractor = sb_cls.mods.compute_features
+                CLS = OnnxClassifier(final_path, feature_extractor, sample_rate=16000, device=MATCH_DEVICE)
+                cls_loaded_onnx = True
+            except Exception as e:
+                print(f"Failed to load ONNX model {final_path}: {e}")
+                cls_loaded_onnx = False
+
+    if not cls_loaded_onnx:
+        print("Loading PyTorch model for ecapa_voxceleb...")
+        if ENABLE_ONNX: # sb_cls was loaded on cpu
+             if MATCH_DEVICE != "cpu":
+                 sb_cls = sb_cls.to(MATCH_DEVICE)
+        CLS = sb_cls
     else:
-        CLS = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb",
-            savedir=os.path.join("pretrained_models", "spkrec-ecapa-voxceleb"),
-            run_opts={"device": MATCH_DEVICE},
-        )
+        pass # CLS already set
     PRELOAD_TIMES["classifier"] = time.time() - t2
     CLS_SR = int(getattr(CLS.hparams, "sample_rate", 16000))
 
