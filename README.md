@@ -61,7 +61,7 @@ python sp.py mixed.wav -n 2 -t target.wav --device cpu
 - `ENABLE_ONNX = True`: 启用 ONNX Runtime 加速（推荐）。
 - `FORCE_ONNX_CPU = True`: 强制使用 CPU 进行 ONNX 推理，并启用 INT8 量化模型（需先运行量化脚本）。
 
-### 模型量化 (推荐 CPU 环境使用)
+### 模型量化 (推荐 CPU 环境使用, 运行export的脚本可以导出32的onnx，之后放到onnx目录再执行量化脚本生成int8的onnx)
 如果在 CPU 环境下运行，建议使用量化模型以获得最佳性能（速度提升约 2-3 倍）。
 
 1. 确保 `onnx/` 目录下有原始 `.onnx` 模型文件。
