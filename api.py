@@ -116,7 +116,7 @@ CLS_SR = 16000
 MAIN_DEVICE = "cpu"
 MATCH_DEVICE = "cpu"
 ENABLE_ONNX = True
-FORCE_ONNX_CPU = True
+FORCE_ONNX_CPU = False
 ONNX_DIR = os.path.join(os.path.dirname(__file__), "onnx")
 
 
@@ -147,6 +147,7 @@ class OnnxSepformer:
         if ort is None:
             raise ImportError("onnxruntime is required for ONNX support")
         
+        self.path = path
         self.hparams = type("HParams", (), {"sample_rate": sample_rate})()
         
         sess_options = ort.SessionOptions()
@@ -156,34 +157,25 @@ class OnnxSepformer:
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
         if device == "cuda":
-            # Priority: TensorRT -> CUDA -> CPU
-            providers = [
-                ("TensorrtExecutionProvider", {
-                    "trt_engine_cache_enable": True,
-                    "trt_engine_cache_path": os.path.join(os.path.dirname(path), "trt_cache"),
-                    "trt_fp16_enable": True,
-                }), 
-                "CUDAExecutionProvider", 
-                "CPUExecutionProvider"
-            ]
-            
-            # Suppress TensorRT failure logs by redirecting stderr/stdout temporarily
+            # Priority: CUDA -> CPU
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
             try:
                 with RedirectStream():
                     self.sess = ort.InferenceSession(path, providers=providers, sess_options=sess_options)
-            except Exception:
+            except Exception as e:
+                print(f"Failed to initialize ONNX session with CUDA: {e}")
                 self.sess = None
-
+            
             # Check if we actually got a GPU provider
             current_providers = self.sess.get_providers() if self.sess else []
-            if "TensorrtExecutionProvider" not in current_providers and "CUDAExecutionProvider" not in current_providers:
-                # Fallback to CUDA only
-                try:
-                    with RedirectStream():
-                        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-                        self.sess = ort.InferenceSession(path, providers=providers, sess_options=sess_options)
-                except Exception:
-                    pass
+            if "CUDAExecutionProvider" not in current_providers:
+                 print("Falling back to CPU execution provider for ONNX")
+                 try:
+                    providers = ["CPUExecutionProvider"]
+                    self.sess = ort.InferenceSession(path, providers=providers, sess_options=sess_options)
+                 except Exception as e:
+                     print(f"Failed to initialize ONNX session with CPU: {e}")
+                     self.sess = None
         else:
             if FORCE_ONNX_CPU:
                 # 使用量化后的模型（如果存在）
@@ -199,6 +191,12 @@ class OnnxSepformer:
                 
                 self.sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"], sess_options=sess_options)
             else:
+                # 允许使用 GPU (如果未强制 CPU) 但 device 参数为 "cpu" 的情况 (例如作为后备)
+                # 但通常 device 参数由调用者控制。如果调用者传入 "cpu"，我们尊重它。
+                # 不过，如果存在 int8 模型，我们也可以尝试加载它，因为 onnxruntime-gpu 也能运行 int8 模型
+                path_int8 = path.replace(".onnx", "_int8.onnx")
+                if os.path.exists(path_int8):
+                    path = path_int8
                 self.sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"], sess_options=sess_options)
             
     def warmup(self):
@@ -215,11 +213,79 @@ class OnnxSepformer:
                 print(f"Warmup failed for {input_name}: {e}")
 
     def separate_batch(self, mix):
+        if self.sess is None:
+            raise RuntimeError("ONNX model session is not initialized")
         # mix: torch tensor (batch, time)
-        mix_np = mix.detach().cpu().numpy()
         input_name = self.sess.get_inputs()[0].name
-        out = self.sess.run(None, {input_name: mix_np})[0]
-        return torch.from_numpy(out).to(mix.device)
+        
+        # Check if model expects FP16 input (based on file name or inference)
+        is_fp16 = self.path.endswith("_fp16.onnx")
+        
+        # Use IO Binding for GPU inference if available
+        if "CUDAExecutionProvider" in self.sess.get_providers() and mix.device.type == "cuda":
+            # Input is already on GPU (torch tensor)
+            # Create OrtValue from the existing GPU tensor without copying
+            # Note: We need to ensure the tensor is contiguous and correct type
+            
+            if is_fp16:
+                mix = mix.contiguous().half() # Convert to float16
+                elem_type = np.float16
+            else:
+                mix = mix.contiguous().float() # Convert to float32
+                elem_type = np.float32
+            
+            # Get data pointer and shape
+            data_ptr = mix.data_ptr()
+            shape = tuple(mix.shape)
+            
+            io_binding = self.sess.io_binding()
+            
+            # Bind input (already on GPU)
+            io_binding.bind_input(
+                name=input_name,
+                device_type='cuda',
+                device_id=mix.device.index if mix.device.index is not None else 0,
+                element_type=elem_type,
+                shape=shape,
+                buffer_ptr=data_ptr
+            )
+            
+            # Bind output to GPU
+            # We don't know the exact output shape beforehand for dynamic axes, 
+            # but bind_output without shape will allocate it on the device.
+            output_name = self.sess.get_outputs()[0].name
+            io_binding.bind_output(output_name, 'cuda')
+            
+            # Run
+            self.sess.run_with_iobinding(io_binding)
+            
+            # Get output as OrtValue (still on GPU)
+            ort_output = io_binding.get_outputs()[0]
+            
+            # Convert to Torch Tensor (zero-copy if possible, but dlpack is safest)
+            # ORT -> DLPack -> Torch
+            try:
+                from torch.utils.dlpack import from_dlpack
+                out_tensor = from_dlpack(ort_output.to_dlpack())
+                # If model output FP16, convert back to FP32 if needed by downstream
+                if out_tensor.dtype == torch.float16:
+                    out_tensor = out_tensor.float()
+                return out_tensor
+            except Exception:
+                # Fallback: copy to CPU then to GPU (slower)
+                out_np = ort_output.numpy()
+                return torch.from_numpy(out_np).to(mix.device).float()
+        else:
+            # CPU fallback or CPU device
+            mix_np = mix.detach().cpu().numpy()
+            if is_fp16:
+                mix_np = mix_np.astype(np.float16)
+            
+            out = self.sess.run(None, {input_name: mix_np})[0]
+            out_tensor = torch.from_numpy(out).to(mix.device)
+            if out_tensor.dtype == torch.float16:
+                out_tensor = out_tensor.float()
+            return out_tensor
 
 
 class OnnxClassifier:
@@ -227,6 +293,7 @@ class OnnxClassifier:
         if ort is None:
             raise ImportError("onnxruntime is required for ONNX support")
             
+        self.path = path
         self.compute_features = feature_extractor
         self.hparams = type("HParams", (), {"sample_rate": sample_rate})()
         
@@ -237,32 +304,25 @@ class OnnxClassifier:
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         
         if device == "cuda":
-            # Priority: TensorRT -> CUDA -> CPU
-            providers = [
-                ("TensorrtExecutionProvider", {
-                    "trt_engine_cache_enable": True,
-                    "trt_engine_cache_path": os.path.join(os.path.dirname(path), "trt_cache"),
-                    "trt_fp16_enable": True,
-                }), 
-                "CUDAExecutionProvider", 
-                "CPUExecutionProvider"
-            ]
+            # Priority: CUDA -> CPU
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
             try:
                 with RedirectStream():
                     self.sess = ort.InferenceSession(path, providers=providers, sess_options=sess_options)
-            except Exception:
+            except Exception as e:
+                print(f"Failed to initialize ONNX session with CUDA: {e}")
                 self.sess = None
-                
+            
             # Check if we actually got a GPU provider
             current_providers = self.sess.get_providers() if self.sess else []
-            if "TensorrtExecutionProvider" not in current_providers and "CUDAExecutionProvider" not in current_providers:
-                # Fallback to CUDA only
-                try:
-                    with RedirectStream():
-                        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-                        self.sess = ort.InferenceSession(path, providers=providers, sess_options=sess_options)
-                except Exception:
-                    pass
+            if "CUDAExecutionProvider" not in current_providers:
+                 print("Falling back to CPU execution provider for ONNX")
+                 try:
+                    providers = ["CPUExecutionProvider"]
+                    self.sess = ort.InferenceSession(path, providers=providers, sess_options=sess_options)
+                 except Exception as e:
+                     print(f"Failed to initialize ONNX session with CPU: {e}")
+                     self.sess = None
         else:
             if FORCE_ONNX_CPU:
                 # 使用量化后的模型（如果存在）
@@ -278,6 +338,12 @@ class OnnxClassifier:
                 
                 self.sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"], sess_options=sess_options)
             else:
+                # 允许使用 GPU (如果未强制 CPU) 但 device 参数为 "cpu" 的情况 (例如作为后备)
+                # 但通常 device 参数由调用者控制。如果调用者传入 "cpu"，我们尊重它。
+                # 不过，如果存在 int8 模型，我们也可以尝试加载它，因为 onnxruntime-gpu 也能运行 int8 模型
+                path_int8 = path.replace(".onnx", "_int8.onnx")
+                if os.path.exists(path_int8):
+                    path = path_int8
                 self.sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"], sess_options=sess_options)
 
     def warmup(self):
@@ -294,13 +360,72 @@ class OnnxClassifier:
                 print(f"Warmup failed for {input_name}: {e}")
 
     def encode_batch(self, wavs):
+        if self.sess is None:
+            raise RuntimeError("ONNX model session is not initialized")
         # wavs: torch tensor (batch, time)
         # Feature extraction
         feats = self.compute_features(wavs)
-        feats_np = feats.detach().cpu().numpy()
         input_name = self.sess.get_inputs()[0].name
-        out = self.sess.run(None, {input_name: feats_np})[0]
-        return torch.from_numpy(out).to(wavs.device)
+        
+        # Check if model expects FP16 input (based on file name or inference)
+        is_fp16 = self.path.endswith("_fp16.onnx")
+        
+        # Use IO Binding for GPU inference if available
+        if "CUDAExecutionProvider" in self.sess.get_providers() and wavs.device.type == "cuda":
+            # Input features are on GPU
+            
+            if is_fp16:
+                feats = feats.contiguous().half()
+                elem_type = np.float16
+            else:
+                feats = feats.contiguous().float()
+                elem_type = np.float32
+                
+            # Get data pointer and shape
+            data_ptr = feats.data_ptr()
+            shape = tuple(feats.shape)
+            
+            io_binding = self.sess.io_binding()
+            
+            # Bind input (already on GPU)
+            io_binding.bind_input(
+                name=input_name,
+                device_type='cuda',
+                device_id=wavs.device.index if wavs.device.index is not None else 0,
+                element_type=elem_type,
+                shape=shape,
+                buffer_ptr=data_ptr
+            )
+            
+            # Bind output to GPU
+            output_name = self.sess.get_outputs()[0].name
+            io_binding.bind_output(output_name, 'cuda')
+            
+            # Run
+            self.sess.run_with_iobinding(io_binding)
+            
+            # Get output as OrtValue (still on GPU)
+            ort_output = io_binding.get_outputs()[0]
+            
+            # Convert to Torch Tensor (zero-copy if possible, but dlpack is safest)
+            try:
+                from torch.utils.dlpack import from_dlpack
+                out_tensor = from_dlpack(ort_output.to_dlpack())
+                if out_tensor.dtype == torch.float16:
+                    out_tensor = out_tensor.float()
+                return out_tensor
+            except Exception:
+                out_np = ort_output.numpy()
+                return torch.from_numpy(out_np).to(wavs.device).float()
+        else:
+            feats_np = feats.detach().cpu().numpy()
+            if is_fp16:
+                feats_np = feats_np.astype(np.float16)
+            out = self.sess.run(None, {input_name: feats_np})[0]
+            out_tensor = torch.from_numpy(out).to(wavs.device)
+            if out_tensor.dtype == torch.float16:
+                out_tensor = out_tensor.float()
+            return out_tensor
 
 
 @asynccontextmanager
@@ -313,41 +438,43 @@ async def lifespan(app: FastAPI):
         MAIN_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
         MATCH_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Configure TensorRT paths if enabled and using CUDA
-    if ENABLE_ONNX and MAIN_DEVICE == "cuda":
-        try:
-            import tensorrt
-            trt_path = os.path.dirname(tensorrt.__file__)
-            # Add TensorRT libs to LD_LIBRARY_PATH (Linux) and PATH (Windows)
-            # This helps onnxruntime find libnvinfer.so / nvinfer.dll
-            
-            # Linux
-            current_ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-            if trt_path not in current_ld_path:
-                os.environ["LD_LIBRARY_PATH"] = f"{trt_path}{os.pathsep}{current_ld_path}"
-                # Also try to add the lib folder inside tensorrt package if it exists
-                trt_lib_path = os.path.join(trt_path, "lib")
-                if os.path.exists(trt_lib_path):
-                     os.environ["LD_LIBRARY_PATH"] = f"{trt_lib_path}{os.pathsep}{os.environ['LD_LIBRARY_PATH']}"
-
-            # Windows
-            current_path = os.environ.get("PATH", "")
-            if trt_path not in current_path:
-                os.environ["PATH"] = f"{trt_path}{os.pathsep}{current_path}"
-                trt_lib_path = os.path.join(trt_path, "lib")
-                if os.path.exists(trt_lib_path):
-                     os.environ["PATH"] = f"{trt_lib_path}{os.pathsep}{os.environ['PATH']}"
-            
-            # Re-import onnxruntime might be needed if it was already imported, 
-            # but usually setting env var before session creation is enough if ORT loads libs dynamically.
-            # However, ORT might have already cached load failures.
-        except ImportError:
-            pass
-
     t0 = time.time()
 
     if ENABLE_ONNX:
         sep2_path = os.path.join(ONNX_DIR, "sepformer_wsj02mix.onnx")
+        # Ensure model exists, otherwise export it
+        if not os.path.exists(sep2_path) and not os.path.exists(sep2_path.replace(".onnx", "_int8.onnx")) and not os.path.exists(sep2_path.replace(".onnx", "_fp16.onnx")):
+            print(f"Model {sep2_path} not found. Exporting from SpeechBrain...")
+            temp_model = SepformerSeparation.from_hparams(
+                source="speechbrain/sepformer-wsj02mix",
+                savedir=os.path.join("pretrained_models", "sepformer-wsj02mix"),
+                run_opts={"device": "cpu"},
+            )
+            os.makedirs(ONNX_DIR, exist_ok=True)
+            # Dummy input for export: [batch, time]
+            dummy_input = torch.randn(1, 16000)
+            torch.onnx.export(
+                temp_model.mods.encoder.model,
+                (dummy_input,),
+                sep2_path,
+                input_names=["mix"],
+                output_names=["est_sources"],
+                dynamic_axes={"mix": {0: "batch", 1: "time"}, "est_sources": {0: "batch", 2: "time"}},
+                opset_version=17
+            )
+            print(f"Exported {sep2_path}")
+            del temp_model
+            
+        # Automatically use quantized/optimized model if available
+        # Priority: FP16 -> INT8 -> FP32
+        sep2_path_fp16 = sep2_path.replace(".onnx", "_fp16.onnx")
+        sep2_path_int8 = sep2_path.replace(".onnx", "_int8.onnx")
+        
+        if os.path.exists(sep2_path_fp16):
+            sep2_path = sep2_path_fp16
+        elif os.path.exists(sep2_path_int8):
+            sep2_path = sep2_path_int8
+            
         SEP_MODELS["2"] = OnnxSepformer(sep2_path, sample_rate=8000, device=MAIN_DEVICE)
     else:
         SEP_MODELS["2"] = SepformerSeparation.from_hparams(
@@ -362,6 +489,39 @@ async def lifespan(app: FastAPI):
 
     if ENABLE_ONNX:
         sep3_path = os.path.join(ONNX_DIR, "sepformer_wsj03mix.onnx")
+        # Ensure model exists, otherwise export it
+        if not os.path.exists(sep3_path) and not os.path.exists(sep3_path.replace(".onnx", "_int8.onnx")) and not os.path.exists(sep3_path.replace(".onnx", "_fp16.onnx")):
+            print(f"Model {sep3_path} not found. Exporting from SpeechBrain...")
+            temp_model = SepformerSeparation.from_hparams(
+                source="speechbrain/sepformer-wsj03mix",
+                savedir=os.path.join("pretrained_models", "sepformer-wsj03mix"),
+                run_opts={"device": "cpu"},
+            )
+            os.makedirs(ONNX_DIR, exist_ok=True)
+            # Dummy input for export: [batch, time]
+            dummy_input = torch.randn(1, 16000)
+            torch.onnx.export(
+                temp_model.mods.encoder.model,
+                (dummy_input,),
+                sep3_path,
+                input_names=["mix"],
+                output_names=["est_sources"],
+                dynamic_axes={"mix": {0: "batch", 1: "time"}, "est_sources": {0: "batch", 2: "time"}},
+                opset_version=17
+            )
+            print(f"Exported {sep3_path}")
+            del temp_model
+            
+        # Automatically use quantized/optimized model if available
+        # Priority: FP16 -> INT8 -> FP32
+        sep3_path_fp16 = sep3_path.replace(".onnx", "_fp16.onnx")
+        sep3_path_int8 = sep3_path.replace(".onnx", "_int8.onnx")
+        
+        if os.path.exists(sep3_path_fp16):
+            sep3_path = sep3_path_fp16
+        elif os.path.exists(sep3_path_int8):
+            sep3_path = sep3_path_int8
+            
         SEP_MODELS["3"] = OnnxSepformer(sep3_path, sample_rate=8000, device=MAIN_DEVICE)
     else:
         SEP_MODELS["3"] = SepformerSeparation.from_hparams(
@@ -382,6 +542,35 @@ async def lifespan(app: FastAPI):
         )
         feature_extractor = sb_cls.mods.compute_features
         cls_path = os.path.join(ONNX_DIR, "ecapa_voxceleb.onnx")
+        # Ensure model exists, otherwise export it
+        if not os.path.exists(cls_path) and not os.path.exists(cls_path.replace(".onnx", "_int8.onnx")) and not os.path.exists(cls_path.replace(".onnx", "_fp16.onnx")):
+            print(f"Model {cls_path} not found. Exporting from SpeechBrain...")
+            os.makedirs(ONNX_DIR, exist_ok=True)
+            # Dummy input for export: [batch, time, 80]
+            dummy_input = torch.randn(1, 100, 80)
+            # Use the feature_extractor logic to get embeddings from features
+            # Note: sb_cls.mods.embedding_model is the core ECAPA model
+            torch.onnx.export(
+                sb_cls.mods.embedding_model,
+                (dummy_input,),
+                cls_path,
+                input_names=["feats"],
+                output_names=["emb"],
+                dynamic_axes={"feats": {0: "batch", 1: "time"}, "emb": {0: "batch"}},
+                opset_version=17
+            )
+            print(f"Exported {cls_path}")
+
+        # Automatically use quantized/optimized model if available
+        # Priority: FP16 -> INT8 -> FP32
+        cls_path_fp16 = cls_path.replace(".onnx", "_fp16.onnx")
+        cls_path_int8 = cls_path.replace(".onnx", "_int8.onnx")
+        
+        if os.path.exists(cls_path_fp16):
+            cls_path = cls_path_fp16
+        elif os.path.exists(cls_path_int8):
+            cls_path = cls_path_int8
+            
         CLS = OnnxClassifier(cls_path, feature_extractor, sample_rate=16000, device=MATCH_DEVICE)
     else:
         CLS = EncoderClassifier.from_hparams(
@@ -392,9 +581,60 @@ async def lifespan(app: FastAPI):
     PRELOAD_TIMES["classifier"] = time.time() - t2
     CLS_SR = int(getattr(CLS.hparams, "sample_rate", 16000))
 
+    # Run dummy inference for warmup
+    print("Warming up models...")
+    
+    # Warmup separation models
+    dummy_input = torch.randn(1, 16000).to(MAIN_DEVICE)
+    
+    # Check if model is FP16 and cast dummy input accordingly
+    # For ONNX models, we need to check the underlying session or path
     if ENABLE_ONNX:
-        asyncio.create_task(run_warmup())
+        for key, model in SEP_MODELS.items():
+            try:
+                # Check if this specific model instance uses an FP16 ONNX file
+                is_fp16 = hasattr(model, 'path') and model.path.endswith("_fp16.onnx")
+                
+                current_input = dummy_input.clone()
+                if is_fp16:
+                    current_input = current_input.half()
+                
+                model.separate_batch(current_input)
+            except Exception as e:
+                print(f"Warmup failed for sepformer_{key}: {e}")
+    else:
+        # PyTorch models usually handle autocast or explicit types
+        for key, model in SEP_MODELS.items():
+            try:
+                model.separate_batch(dummy_input)
+            except Exception as e:
+                print(f"Warmup failed for sepformer_{key}: {e}")
+
+    # Warmup classifier
+    if CLS is not None:
+        dummy_wavs = torch.randn(1, 16000).to(MATCH_DEVICE)
+        try:
+            # Check if classifier is FP16 ONNX
+            is_fp16 = ENABLE_ONNX and hasattr(CLS, 'path') and CLS.path.endswith("_fp16.onnx")
+            
+            if is_fp16:
+                dummy_wavs = dummy_wavs.half()
+                
+            CLS.encode_batch(dummy_wavs)
+        except Exception as e:
+            print(f"Warmup failed for classifier: {e}")
+            
+    print("Models warmed up!")
+    
     yield
+    
+    # Clean up
+    SEP_MODELS.clear()
+    if CLS is not None:
+        CLS = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print("Models cleared.")
 
 
 async def run_warmup():

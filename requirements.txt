@@ -8,5 +8,4 @@ uvicorn
 python-multipart
 pyaudio
 onnx 
-onnxruntime
-tensorrt
+onnxruntime-gpu==1.16.3

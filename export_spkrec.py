@@ -64,7 +64,7 @@ def export_ecapa_to_onnx(output_path="ecapa_voxceleb.onnx"):
         dummy_input,
         output_path,
         export_params=True,
-        opset_version=12, # 建议使用 11 或 12 以获得最佳兼容性
+        opset_version=17, # 建议使用 11 或 12 以获得最佳兼容性
         do_constant_folding=True,
         input_names=['mel_spectrogram'],
         output_names=['embedding'],

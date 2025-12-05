@@ -32,8 +32,8 @@ if not os.path.exists(TEMP_WORK_DIR):
 print(f"已强制设置系统临时目录到: {TEMP_WORK_DIR}")
 
 for model_fp32 in onnx_files:
-    # 跳过已经量化的文件（假设量化文件以 _int8.onnx 结尾）
-    if model_fp32.endswith('_int8.onnx'):
+    # 跳过已经量化的文件（假设量化文件以 _int8.onnx 或 _fp16.onnx 结尾）
+    if model_fp32.endswith('_int8.onnx') or model_fp32.endswith('_fp16.onnx'):
         continue
     
     # 跳过可能残留的中间文件
@@ -42,9 +42,9 @@ for model_fp32 in onnx_files:
         
     filename = os.path.basename(model_fp32)
     name_without_ext = os.path.splitext(filename)[0]
-    model_quant = os.path.join(onnx_dir, f"{name_without_ext}_int8.onnx")
+    model_quant = os.path.join(onnx_dir, f"{name_without_ext}_fp16.onnx")
     
-    print(f"\n正在量化模型: {filename} ...")
+    print(f"\n正在量化模型 (FP16): {filename} ...")
     
     # 定义临时文件路径
     temp_input = os.path.join(TEMP_WORK_DIR, "input.onnx")
@@ -59,12 +59,38 @@ for model_fp32 in onnx_files:
         # 此时我们对 input.onnx 进行操作。
         # 由于我们已经修改了 TEMP/TMP 环境变量，onnxruntime 内部生成的所有临时文件
         # 都应该会去 D:\FastTSE_Quant_Temp，从而避免中文路径问题。
-        print(f"  正在执行动态量化...")
-        quantize_dynamic(
-            model_input=temp_input,
-            model_output=temp_output,
-            weight_type=QuantType.QUInt8
-        )
+        print(f"  正在执行 FP16 转换...")
+        
+        # 使用 convert_float_to_float16 进行 FP16 转换
+        # 注意：FP16 转换通常在 float16 模块中
+        # 我们检查 onnxruntime 是否有 float16 转换工具
+        
+        try:
+            from onnxruntime.quantization.quant_utils import QuantType
+            from onnxruntime.quantization import quantize_dynamic
+            # 这里的 quantize_dynamic 主要用于 int8，对于 fp16，我们需要其他方法
+            # 更好的方法是使用 onnx 库本身或 onnxmltools，但 requirements.txt 里只有 onnx 和 onnxruntime
+            
+            # 让我们尝试使用 onnxruntime 的 convert_float_to_float16
+            from onnxruntime.transformers.float16 import convert_float_to_float16
+            
+            # 先加载模型
+            import onnx
+            model = onnx.load(temp_input)
+            
+            # 转换
+            model_fp16 = convert_float_to_float16(model)
+            
+            # 保存
+            onnx.save(model_fp16, temp_output)
+            
+        except ImportError:
+            print("  onnxruntime.transformers.float16 未找到，尝试使用 quantize_dynamic (但这通常是 int8)...")
+            # 如果找不到 fp16 工具，回退到 int8 (虽然用户要求 fp16，但如果没有工具也没办法)
+            # 或者我们可以尝试手动转换节点... 但太复杂了
+            # 这里我们假设用户安装了完整的 onnxruntime，其中包含 transformers 工具
+            raise ImportError("需要 onnxruntime-gpu 或安装了 transformers 工具的 onnxruntime 版本来支持 FP16 转换")
+
         
         # 3. 将结果拷回
         print(f"  正在保存量化结果...")
