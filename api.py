@@ -114,7 +114,6 @@ SEP_SR = 16000
 CLS_SR = 16000
 MAIN_DEVICE = "cpu"
 MATCH_DEVICE = "cpu"
-ENABLE_QUANTIZATION = False
 ENABLE_ONNX = False
 ONNX_DIR = os.path.join(os.path.dirname(__file__), "onnx")
 
@@ -229,12 +228,8 @@ class OnnxClassifier:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global SEP_MODELS, CLS, PRELOAD_TIMES, SEP_SR, CLS_SR, MAIN_DEVICE, MATCH_DEVICE
-    if ENABLE_QUANTIZATION:
-        MAIN_DEVICE = "cpu"
-        MATCH_DEVICE = "cpu"
-    else:
-        MAIN_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-        MATCH_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    MAIN_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    MATCH_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Configure TensorRT paths if enabled and using CUDA
     if ENABLE_ONNX and MAIN_DEVICE == "cuda":
@@ -278,28 +273,6 @@ async def lifespan(app: FastAPI):
             savedir=os.path.join("pretrained_models", "sepformer-wsj02mix"),
             run_opts={"device": MAIN_DEVICE},
         )
-        if ENABLE_QUANTIZATION:
-            try:
-                # Try 'masknet' which is common for SepFormer
-                inner_model = SEP_MODELS["2"].mods["masknet"]
-                quantized_inner_model = torch.quantization.quantize_dynamic(
-                    inner_model,
-                    {torch.nn.Linear},
-                    dtype=torch.qint8
-                )
-                SEP_MODELS["2"].mods["masknet"] = quantized_inner_model
-            except (AttributeError, KeyError):
-                try:
-                    # Fallback to 'model'
-                    inner_model = SEP_MODELS["2"].mods["model"]
-                    quantized_inner_model = torch.quantization.quantize_dynamic(
-                        inner_model,
-                        {torch.nn.Linear},
-                        dtype=torch.qint8
-                    )
-                    SEP_MODELS["2"].mods["model"] = quantized_inner_model
-                except Exception:
-                     print(f"Warning: Failed to quantize sepformer_2. Available mods: {list(SEP_MODELS['2'].mods.keys()) if hasattr(SEP_MODELS['2'], 'mods') else 'No mods'}")
 
     PRELOAD_TIMES["sepformer_2"] = time.time() - t0
     SEP_SR = int(getattr(SEP_MODELS["2"].hparams, "sample_rate", 16000))
@@ -314,26 +287,6 @@ async def lifespan(app: FastAPI):
             savedir=os.path.join("pretrained_models", "sepformer-wsj03mix"),
             run_opts={"device": MAIN_DEVICE},
         )
-        if ENABLE_QUANTIZATION:
-            try:
-                inner_model = SEP_MODELS["3"].mods["masknet"]
-                quantized_inner_model = torch.quantization.quantize_dynamic(
-                    inner_model,
-                    {torch.nn.Linear},
-                    dtype=torch.qint8
-                )
-                SEP_MODELS["3"].mods["masknet"] = quantized_inner_model
-            except (AttributeError, KeyError):
-                  try:
-                     inner_model = SEP_MODELS["3"].mods["model"]
-                     quantized_inner_model = torch.quantization.quantize_dynamic(
-                         inner_model,
-                         {torch.nn.Linear},
-                         dtype=torch.qint8
-                     )
-                     SEP_MODELS["3"].mods["model"] = quantized_inner_model
-                  except Exception:
-                     print(f"Warning: Failed to quantize sepformer_3. Available mods: {list(SEP_MODELS['3'].mods.keys()) if hasattr(SEP_MODELS['3'], 'mods') else 'No mods'}")
 
     PRELOAD_TIMES["sepformer_3"] = time.time() - t1
     t2 = time.time()
@@ -354,26 +307,6 @@ async def lifespan(app: FastAPI):
             savedir=os.path.join("pretrained_models", "spkrec-ecapa-voxceleb"),
             run_opts={"device": MATCH_DEVICE},
         )
-        if ENABLE_QUANTIZATION:
-            try:
-                inner_model = CLS.mods["embedding_model"]
-                quantized_inner_model = torch.quantization.quantize_dynamic(
-                    inner_model,
-                    {torch.nn.Linear},
-                    dtype=torch.qint8
-                )
-                CLS.mods["embedding_model"] = quantized_inner_model
-            except Exception:
-                try:
-                    inner_model = CLS.modules.embedding_model
-                    quantized_inner_model = torch.quantization.quantize_dynamic(
-                        inner_model,
-                        {torch.nn.Linear},
-                        dtype=torch.qint8
-                    )
-                    CLS.modules.embedding_model = quantized_inner_model
-                except Exception:
-                    print("Warning: Failed to quantize classifier")
     PRELOAD_TIMES["classifier"] = time.time() - t2
     CLS_SR = int(getattr(CLS.hparams, "sample_rate", 16000))
     yield
