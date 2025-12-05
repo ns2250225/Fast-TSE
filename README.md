@@ -13,11 +13,12 @@
 pip install -r requirements.txt
 ```
 
-requirements.txt 中包含：`torch`、`torchaudio`、`speechbrain`、`soundfile`、`numpy<2.0`、`fastapi`、`uvicorn`、`python-multipart`
+requirements.txt 中包含：`torch`、`torchaudio`、`speechbrain`、`soundfile`、`numpy<2.0`、`fastapi`、`uvicorn`、`python-multipart`、`onnx`、`onnxruntime` 等。
 
 说明：
-- GPU 可用时自动使用 CUDA；如发生 GPU 端错误将自动回退到 CPU
-- 首次运行会自动下载 SpeechBrain 预训练模型到 `pretrained_models/`
+- **GPU 支持**：默认优先使用 CUDA（如可用）。
+- **ONNX Runtime 加速**：支持使用 ONNX Runtime 进行推理加速（CPU/GPU）。
+- **模型预热**：首次运行会自动下载 SpeechBrain 预训练模型到 `pretrained_models/`。
 
 ## 命令行脚本
 文件：`sp.py`
@@ -52,15 +53,26 @@ python sp.py mixed.wav -n 2 -t target.wav --device cpu
 - `-m, --model`：自定义 SpeechBrain 模型仓库名（默认使用 SepFormer 2/3 人模型）
 - `--output_prefix`：自定义输出文件前缀
 
-输出：
-- 分离音频：`<输入文件名>_spk1.wav`, `<输入文件名>_spk2.wav`, …
-- 目标最匹配音频：`<输入文件名>_target_best.wav`
-- 控制台打印耗时：模型加载、分离、匹配（加载/计算）与总耗时
-
 ## HTTP 服务
 文件：`api.py`
 
-启动：
+### 配置项 (api.py)
+在 `api.py` 开头部分可以配置以下选项：
+- `ENABLE_ONNX = True`: 启用 ONNX Runtime 加速（推荐）。
+- `FORCE_ONNX_CPU = True`: 强制使用 CPU 进行 ONNX 推理，并启用 INT8 量化模型（需先运行量化脚本）。
+
+### 模型量化 (推荐 CPU 环境使用)
+如果在 CPU 环境下运行，建议使用量化模型以获得最佳性能（速度提升约 2-3 倍）。
+
+1. 确保 `onnx/` 目录下有原始 `.onnx` 模型文件。
+2. 运行量化脚本：
+   ```bash
+   python quantize.py
+   ```
+   脚本会自动生成 `_int8.onnx` 后缀的量化模型。
+3. 在 `api.py` 中设置 `FORCE_ONNX_CPU = True`。
+
+### 启动服务
 
 ```bash
 # 方式一：直接运行脚本
@@ -71,13 +83,13 @@ uvicorn api:app --host 0.0.0.0 --port 8000
 ```
 
 启动行为：
-- 应用生命周期的 `lifespan` 在接收请求前预加载模型：
-  - 分离模型：`speechbrain/sepformer-wsj02mix`、`speechbrain/sepformer-wsj03mix`
-  - 说话人分类器：`speechbrain/spkrec-ecapa-voxceleb`
-- 自动选择设备（GPU/CPU）并记录预加载耗时
-- **注意**：系统默认匹配相似度阈值为 `0.25`。若所有分离出的音频与目标音频的相似度均不高于该阈值，则视为未找到目标人。可通过接口参数 `match_threshold` 自定义此阈值。
+- 应用生命周期的 `lifespan` 在接收请求前预加载模型。
+- 自动进行模型预热（Warmup），避免首次请求延迟。
+- 如果启用了 ONNX，会自动加载 TensorRT（GPU）或 Quantized INT8（CPU）模型。
 
-### JSON 端点
+### 接口文档
+
+#### JSON 端点
 `POST /separate-match`
 - `multipart/form-data`
 - 字段：
@@ -109,7 +121,7 @@ curl -X POST \
   - `code`: -1
   - `message`: "没有目标人声音"
 
-### 字节流端点
+#### 字节流端点
 `POST /separate-match-wav`
 - `multipart/form-data`
 - 字段与 JSON 端点一致
@@ -144,7 +156,9 @@ curl -X POST \
 ## 项目结构
 - `sp.py`：命令行分离与目标匹配脚本
 - `api.py`：FastAPI 服务，提供 JSON 与字节流端点
+- `quantize.py`: ONNX 模型量化脚本
 - `requirements.txt`：依赖列表
+- `onnx/`: 存放 ONNX 模型文件
 
 ## 许可
 此项目用于演示/实验用途。

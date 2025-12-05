@@ -5,6 +5,7 @@ import time
 import math
 import base64
 import wave
+import asyncio
 from typing import Optional
 from contextlib import asynccontextmanager
 
@@ -114,7 +115,8 @@ SEP_SR = 16000
 CLS_SR = 16000
 MAIN_DEVICE = "cpu"
 MATCH_DEVICE = "cpu"
-ENABLE_ONNX = False
+ENABLE_ONNX = True
+FORCE_ONNX_CPU = True
 ONNX_DIR = os.path.join(os.path.dirname(__file__), "onnx")
 
 
@@ -149,10 +151,21 @@ class OnnxSepformer:
         
         sess_options = ort.SessionOptions()
         sess_options.log_severity_level = 4  # Fatal only
+        
+        # Set graph optimization level
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
         if device == "cuda":
             # Priority: TensorRT -> CUDA -> CPU
-            providers = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+            providers = [
+                ("TensorrtExecutionProvider", {
+                    "trt_engine_cache_enable": True,
+                    "trt_engine_cache_path": os.path.join(os.path.dirname(path), "trt_cache"),
+                    "trt_fp16_enable": True,
+                }), 
+                "CUDAExecutionProvider", 
+                "CPUExecutionProvider"
+            ]
             
             # Suppress TensorRT failure logs by redirecting stderr/stdout temporarily
             try:
@@ -172,7 +185,34 @@ class OnnxSepformer:
                 except Exception:
                     pass
         else:
-            self.sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"], sess_options=sess_options)
+            if FORCE_ONNX_CPU:
+                # 使用量化后的模型（如果存在）
+                # 假设量化模型与原模型在同一目录，后缀为 _int8.onnx
+                path_int8 = path.replace(".onnx", "_int8.onnx")
+                if os.path.exists(path_int8):
+                    path = path_int8
+                    
+                # CPU 优化配置
+                sess_options.intra_op_num_threads = 4  # 物理核心数
+                sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+                sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                
+                self.sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"], sess_options=sess_options)
+            else:
+                self.sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"], sess_options=sess_options)
+            
+    def warmup(self):
+        if self.sess:
+            # Create dummy input for warmup
+            # Input: mix, shape: ['batch_size', 'time']
+            # Use a reasonable length, e.g., 1 second at 8000Hz
+            dummy_input = np.random.randn(1, 8000).astype(np.float32)
+            input_name = self.sess.get_inputs()[0].name
+            try:
+                self.sess.run(None, {input_name: dummy_input})
+                print(f"Warmup successful for {input_name}")
+            except Exception as e:
+                print(f"Warmup failed for {input_name}: {e}")
 
     def separate_batch(self, mix):
         # mix: torch tensor (batch, time)
@@ -193,9 +233,20 @@ class OnnxClassifier:
         sess_options = ort.SessionOptions()
         sess_options.log_severity_level = 4  # Fatal only
         
+        # Set graph optimization level
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        
         if device == "cuda":
             # Priority: TensorRT -> CUDA -> CPU
-            providers = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+            providers = [
+                ("TensorrtExecutionProvider", {
+                    "trt_engine_cache_enable": True,
+                    "trt_engine_cache_path": os.path.join(os.path.dirname(path), "trt_cache"),
+                    "trt_fp16_enable": True,
+                }), 
+                "CUDAExecutionProvider", 
+                "CPUExecutionProvider"
+            ]
             try:
                 with RedirectStream():
                     self.sess = ort.InferenceSession(path, providers=providers, sess_options=sess_options)
@@ -213,7 +264,34 @@ class OnnxClassifier:
                 except Exception:
                     pass
         else:
-             self.sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"], sess_options=sess_options)
+            if FORCE_ONNX_CPU:
+                # 使用量化后的模型（如果存在）
+                # 假设量化模型与原模型在同一目录，后缀为 _int8.onnx
+                path_int8 = path.replace(".onnx", "_int8.onnx")
+                if os.path.exists(path_int8):
+                    path = path_int8
+                    
+                # CPU 优化配置
+                sess_options.intra_op_num_threads = 4  # 物理核心数
+                sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+                sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                
+                self.sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"], sess_options=sess_options)
+            else:
+                self.sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"], sess_options=sess_options)
+
+    def warmup(self):
+        if self.sess:
+            # Create dummy input for warmup
+            # Input: mel_spectrogram, shape: ['batch_size', 'time', 80]
+            # Use a reasonable length, e.g., 1 second -> ~100 frames
+            dummy_input = np.random.randn(1, 100, 80).astype(np.float32)
+            input_name = self.sess.get_inputs()[0].name
+            try:
+                self.sess.run(None, {input_name: dummy_input})
+                print(f"Warmup successful for {input_name}")
+            except Exception as e:
+                print(f"Warmup failed for {input_name}: {e}")
 
     def encode_batch(self, wavs):
         # wavs: torch tensor (batch, time)
@@ -228,8 +306,12 @@ class OnnxClassifier:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global SEP_MODELS, CLS, PRELOAD_TIMES, SEP_SR, CLS_SR, MAIN_DEVICE, MATCH_DEVICE
-    MAIN_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    MATCH_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    if FORCE_ONNX_CPU:
+        MAIN_DEVICE = "cpu"
+        MATCH_DEVICE = "cpu"
+    else:
+        MAIN_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+        MATCH_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Configure TensorRT paths if enabled and using CUDA
     if ENABLE_ONNX and MAIN_DEVICE == "cuda":
@@ -309,14 +391,24 @@ async def lifespan(app: FastAPI):
         )
     PRELOAD_TIMES["classifier"] = time.time() - t2
     CLS_SR = int(getattr(CLS.hparams, "sample_rate", 16000))
+
+    if ENABLE_ONNX:
+        asyncio.create_task(run_warmup())
     yield
-    SEP_MODELS.clear()
-    CLS = None
-    PRELOAD_TIMES = {
-        "sepformer_2": 0.0,
-        "sepformer_3": 0.0,
-        "classifier": 0.0,
-    }
+
+
+async def run_warmup():
+    print("Starting model warmup...")
+    loop = asyncio.get_running_loop()
+    
+    if "2" in SEP_MODELS:
+        await loop.run_in_executor(None, SEP_MODELS["2"].warmup)
+    if "3" in SEP_MODELS:
+        await loop.run_in_executor(None, SEP_MODELS["3"].warmup)
+    if CLS:
+        await loop.run_in_executor(None, CLS.warmup)
+        
+    print("Model warmup completed!")
 
 
 app = FastAPI(lifespan=lifespan)
