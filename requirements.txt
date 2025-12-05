@@ -1,7 +1,7 @@
 torchaudio==2.8.0
 soundfile
 numpy<2.0
-speechbrain
+speechbrain==1.0.0
 torch
 fastapi
 uvicorn
