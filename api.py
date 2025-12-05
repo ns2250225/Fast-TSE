@@ -116,8 +116,8 @@ SEP_SR = 16000
 CLS_SR = 16000
 MAIN_DEVICE = "cpu"
 MATCH_DEVICE = "cpu"
-ENABLE_ONNX = True
-FORCE_ONNX_CPU = True
+ENABLE_ONNX = False
+FORCE_ONNX_CPU = False
 ONNX_DIR = os.path.join(os.path.dirname(__file__), "onnx")
 
 
