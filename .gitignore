@@ -1,0 +1,10 @@
+onnx/*
+!onnx/.gitkeep
+__pycache__/
+*.py[cod]
+*$py.class
+pretrained_models/
+.env
+.venv
+env/
+venv/

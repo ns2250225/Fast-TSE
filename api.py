@@ -1,4 +1,5 @@
 import os
+import sys
 import io
 import time
 import math
@@ -14,7 +15,15 @@ import soundfile as sf
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse, Response
-from speechbrain.pretrained import SepformerSeparation, EncoderClassifier
+try:
+    from speechbrain.inference import SepformerSeparation, EncoderClassifier
+except ImportError:
+    from speechbrain.pretrained import SepformerSeparation, EncoderClassifier
+
+try:
+    import onnxruntime as ort
+except ImportError:
+    ort = None
 
 
 def _is_torch_tensor(x):
@@ -106,6 +115,115 @@ CLS_SR = 16000
 MAIN_DEVICE = "cpu"
 MATCH_DEVICE = "cpu"
 ENABLE_QUANTIZATION = False
+ENABLE_ONNX = False
+ONNX_DIR = os.path.join(os.path.dirname(__file__), "onnx")
+
+
+class RedirectStream(object):
+    def __init__(self):
+        pass
+
+    def __enter__(self):
+        self.devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        self.saved_stdout_fd = os.dup(1)
+        self.saved_stderr_fd = os.dup(2)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(self.devnull_fd, 1)
+        os.dup2(self.devnull_fd, 2)
+        return self
+
+    def __exit__(self, *args):
+        os.dup2(self.saved_stdout_fd, 1)
+        os.dup2(self.saved_stderr_fd, 2)
+        os.close(self.saved_stdout_fd)
+        os.close(self.saved_stderr_fd)
+        os.close(self.devnull_fd)
+
+
+class OnnxSepformer:
+    def __init__(self, path, sample_rate=8000, device="cpu"):
+        if ort is None:
+            raise ImportError("onnxruntime is required for ONNX support")
+        
+        self.hparams = type("HParams", (), {"sample_rate": sample_rate})()
+        
+        sess_options = ort.SessionOptions()
+        sess_options.log_severity_level = 4  # Fatal only
+
+        if device == "cuda":
+            # Priority: TensorRT -> CUDA -> CPU
+            providers = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+            
+            # Suppress TensorRT failure logs by redirecting stderr/stdout temporarily
+            try:
+                with RedirectStream():
+                    self.sess = ort.InferenceSession(path, providers=providers, sess_options=sess_options)
+            except Exception:
+                self.sess = None
+
+            # Check if we actually got a GPU provider
+            current_providers = self.sess.get_providers() if self.sess else []
+            if "TensorrtExecutionProvider" not in current_providers and "CUDAExecutionProvider" not in current_providers:
+                # Fallback to CUDA only
+                try:
+                    with RedirectStream():
+                        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                        self.sess = ort.InferenceSession(path, providers=providers, sess_options=sess_options)
+                except Exception:
+                    pass
+        else:
+            self.sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"], sess_options=sess_options)
+
+    def separate_batch(self, mix):
+        # mix: torch tensor (batch, time)
+        mix_np = mix.detach().cpu().numpy()
+        input_name = self.sess.get_inputs()[0].name
+        out = self.sess.run(None, {input_name: mix_np})[0]
+        return torch.from_numpy(out).to(mix.device)
+
+
+class OnnxClassifier:
+    def __init__(self, path, feature_extractor, sample_rate=16000, device="cpu"):
+        if ort is None:
+            raise ImportError("onnxruntime is required for ONNX support")
+            
+        self.compute_features = feature_extractor
+        self.hparams = type("HParams", (), {"sample_rate": sample_rate})()
+        
+        sess_options = ort.SessionOptions()
+        sess_options.log_severity_level = 4  # Fatal only
+        
+        if device == "cuda":
+            # Priority: TensorRT -> CUDA -> CPU
+            providers = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+            try:
+                with RedirectStream():
+                    self.sess = ort.InferenceSession(path, providers=providers, sess_options=sess_options)
+            except Exception:
+                self.sess = None
+                
+            # Check if we actually got a GPU provider
+            current_providers = self.sess.get_providers() if self.sess else []
+            if "TensorrtExecutionProvider" not in current_providers and "CUDAExecutionProvider" not in current_providers:
+                # Fallback to CUDA only
+                try:
+                    with RedirectStream():
+                        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                        self.sess = ort.InferenceSession(path, providers=providers, sess_options=sess_options)
+                except Exception:
+                    pass
+        else:
+             self.sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"], sess_options=sess_options)
+
+    def encode_batch(self, wavs):
+        # wavs: torch tensor (batch, time)
+        # Feature extraction
+        feats = self.compute_features(wavs)
+        feats_np = feats.detach().cpu().numpy()
+        input_name = self.sess.get_inputs()[0].name
+        out = self.sess.run(None, {input_name: feats_np})[0]
+        return torch.from_numpy(out).to(wavs.device)
 
 
 @asynccontextmanager
@@ -117,91 +235,145 @@ async def lifespan(app: FastAPI):
     else:
         MAIN_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
         MATCH_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    t0 = time.time()
-    SEP_MODELS["2"] = SepformerSeparation.from_hparams(
-        source="speechbrain/sepformer-wsj02mix",
-        savedir=os.path.join("pretrained_models", "sepformer-wsj02mix"),
-        run_opts={"device": MAIN_DEVICE},
-    )
-    if ENABLE_QUANTIZATION:
+    
+    # Configure TensorRT paths if enabled and using CUDA
+    if ENABLE_ONNX and MAIN_DEVICE == "cuda":
         try:
-            # Try 'masknet' which is common for SepFormer
-            inner_model = SEP_MODELS["2"].mods["masknet"]
-            quantized_inner_model = torch.quantization.quantize_dynamic(
-                inner_model,
-                {torch.nn.Linear},
-                dtype=torch.qint8
-            )
-            SEP_MODELS["2"].mods["masknet"] = quantized_inner_model
-        except (AttributeError, KeyError):
+            import tensorrt
+            trt_path = os.path.dirname(tensorrt.__file__)
+            # Add TensorRT libs to LD_LIBRARY_PATH (Linux) and PATH (Windows)
+            # This helps onnxruntime find libnvinfer.so / nvinfer.dll
+            
+            # Linux
+            current_ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+            if trt_path not in current_ld_path:
+                os.environ["LD_LIBRARY_PATH"] = f"{trt_path}{os.pathsep}{current_ld_path}"
+                # Also try to add the lib folder inside tensorrt package if it exists
+                trt_lib_path = os.path.join(trt_path, "lib")
+                if os.path.exists(trt_lib_path):
+                     os.environ["LD_LIBRARY_PATH"] = f"{trt_lib_path}{os.pathsep}{os.environ['LD_LIBRARY_PATH']}"
+
+            # Windows
+            current_path = os.environ.get("PATH", "")
+            if trt_path not in current_path:
+                os.environ["PATH"] = f"{trt_path}{os.pathsep}{current_path}"
+                trt_lib_path = os.path.join(trt_path, "lib")
+                if os.path.exists(trt_lib_path):
+                     os.environ["PATH"] = f"{trt_lib_path}{os.pathsep}{os.environ['PATH']}"
+            
+            # Re-import onnxruntime might be needed if it was already imported, 
+            # but usually setting env var before session creation is enough if ORT loads libs dynamically.
+            # However, ORT might have already cached load failures.
+        except ImportError:
+            pass
+
+    t0 = time.time()
+
+    if ENABLE_ONNX:
+        sep2_path = os.path.join(ONNX_DIR, "sepformer_wsj02mix.onnx")
+        SEP_MODELS["2"] = OnnxSepformer(sep2_path, sample_rate=8000, device=MAIN_DEVICE)
+    else:
+        SEP_MODELS["2"] = SepformerSeparation.from_hparams(
+            source="speechbrain/sepformer-wsj02mix",
+            savedir=os.path.join("pretrained_models", "sepformer-wsj02mix"),
+            run_opts={"device": MAIN_DEVICE},
+        )
+        if ENABLE_QUANTIZATION:
             try:
-                # Fallback to 'model'
-                inner_model = SEP_MODELS["2"].mods["model"]
+                # Try 'masknet' which is common for SepFormer
+                inner_model = SEP_MODELS["2"].mods["masknet"]
                 quantized_inner_model = torch.quantization.quantize_dynamic(
                     inner_model,
                     {torch.nn.Linear},
                     dtype=torch.qint8
                 )
-                SEP_MODELS["2"].mods["model"] = quantized_inner_model
-            except Exception:
-                 print(f"Warning: Failed to quantize sepformer_2. Available mods: {list(SEP_MODELS['2'].mods.keys()) if hasattr(SEP_MODELS['2'], 'mods') else 'No mods'}")
+                SEP_MODELS["2"].mods["masknet"] = quantized_inner_model
+            except (AttributeError, KeyError):
+                try:
+                    # Fallback to 'model'
+                    inner_model = SEP_MODELS["2"].mods["model"]
+                    quantized_inner_model = torch.quantization.quantize_dynamic(
+                        inner_model,
+                        {torch.nn.Linear},
+                        dtype=torch.qint8
+                    )
+                    SEP_MODELS["2"].mods["model"] = quantized_inner_model
+                except Exception:
+                     print(f"Warning: Failed to quantize sepformer_2. Available mods: {list(SEP_MODELS['2'].mods.keys()) if hasattr(SEP_MODELS['2'], 'mods') else 'No mods'}")
 
     PRELOAD_TIMES["sepformer_2"] = time.time() - t0
     SEP_SR = int(getattr(SEP_MODELS["2"].hparams, "sample_rate", 16000))
     t1 = time.time()
-    SEP_MODELS["3"] = SepformerSeparation.from_hparams(
-        source="speechbrain/sepformer-wsj03mix",
-        savedir=os.path.join("pretrained_models", "sepformer-wsj03mix"),
-        run_opts={"device": MAIN_DEVICE},
-    )
-    if ENABLE_QUANTIZATION:
-        try:
-            inner_model = SEP_MODELS["3"].mods["masknet"]
-            quantized_inner_model = torch.quantization.quantize_dynamic(
-                inner_model,
-                {torch.nn.Linear},
-                dtype=torch.qint8
-            )
-            SEP_MODELS["3"].mods["masknet"] = quantized_inner_model
-        except (AttributeError, KeyError):
-              try:
-                 inner_model = SEP_MODELS["3"].mods["model"]
-                 quantized_inner_model = torch.quantization.quantize_dynamic(
-                     inner_model,
-                     {torch.nn.Linear},
-                     dtype=torch.qint8
-                 )
-                 SEP_MODELS["3"].mods["model"] = quantized_inner_model
-              except Exception:
-                 print(f"Warning: Failed to quantize sepformer_3. Available mods: {list(SEP_MODELS['3'].mods.keys()) if hasattr(SEP_MODELS['3'], 'mods') else 'No mods'}")
 
-    PRELOAD_TIMES["sepformer_3"] = time.time() - t1
-    t2 = time.time()
-    CLS = EncoderClassifier.from_hparams(
-        source="speechbrain/spkrec-ecapa-voxceleb",
-        savedir=os.path.join("pretrained_models", "spkrec-ecapa-voxceleb"),
-        run_opts={"device": MATCH_DEVICE},
-    )
-    if ENABLE_QUANTIZATION:
-        try:
-            inner_model = CLS.mods["embedding_model"]
-            quantized_inner_model = torch.quantization.quantize_dynamic(
-                inner_model,
-                {torch.nn.Linear},
-                dtype=torch.qint8
-            )
-            CLS.mods["embedding_model"] = quantized_inner_model
-        except Exception:
+    if ENABLE_ONNX:
+        sep3_path = os.path.join(ONNX_DIR, "sepformer_wsj03mix.onnx")
+        SEP_MODELS["3"] = OnnxSepformer(sep3_path, sample_rate=8000, device=MAIN_DEVICE)
+    else:
+        SEP_MODELS["3"] = SepformerSeparation.from_hparams(
+            source="speechbrain/sepformer-wsj03mix",
+            savedir=os.path.join("pretrained_models", "sepformer-wsj03mix"),
+            run_opts={"device": MAIN_DEVICE},
+        )
+        if ENABLE_QUANTIZATION:
             try:
-                inner_model = CLS.modules.embedding_model
+                inner_model = SEP_MODELS["3"].mods["masknet"]
                 quantized_inner_model = torch.quantization.quantize_dynamic(
                     inner_model,
                     {torch.nn.Linear},
                     dtype=torch.qint8
                 )
-                CLS.modules.embedding_model = quantized_inner_model
+                SEP_MODELS["3"].mods["masknet"] = quantized_inner_model
+            except (AttributeError, KeyError):
+                  try:
+                     inner_model = SEP_MODELS["3"].mods["model"]
+                     quantized_inner_model = torch.quantization.quantize_dynamic(
+                         inner_model,
+                         {torch.nn.Linear},
+                         dtype=torch.qint8
+                     )
+                     SEP_MODELS["3"].mods["model"] = quantized_inner_model
+                  except Exception:
+                     print(f"Warning: Failed to quantize sepformer_3. Available mods: {list(SEP_MODELS['3'].mods.keys()) if hasattr(SEP_MODELS['3'], 'mods') else 'No mods'}")
+
+    PRELOAD_TIMES["sepformer_3"] = time.time() - t1
+    t2 = time.time()
+
+    if ENABLE_ONNX:
+        # Load a lightweight classifier just for feature extraction
+        sb_cls = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir=os.path.join("pretrained_models", "spkrec-ecapa-voxceleb"),
+            run_opts={"device": "cpu"},
+        )
+        feature_extractor = sb_cls.mods.compute_features
+        cls_path = os.path.join(ONNX_DIR, "ecapa_voxceleb.onnx")
+        CLS = OnnxClassifier(cls_path, feature_extractor, sample_rate=16000, device=MATCH_DEVICE)
+    else:
+        CLS = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir=os.path.join("pretrained_models", "spkrec-ecapa-voxceleb"),
+            run_opts={"device": MATCH_DEVICE},
+        )
+        if ENABLE_QUANTIZATION:
+            try:
+                inner_model = CLS.mods["embedding_model"]
+                quantized_inner_model = torch.quantization.quantize_dynamic(
+                    inner_model,
+                    {torch.nn.Linear},
+                    dtype=torch.qint8
+                )
+                CLS.mods["embedding_model"] = quantized_inner_model
             except Exception:
-                print("Warning: Failed to quantize classifier")
+                try:
+                    inner_model = CLS.modules.embedding_model
+                    quantized_inner_model = torch.quantization.quantize_dynamic(
+                        inner_model,
+                        {torch.nn.Linear},
+                        dtype=torch.qint8
+                    )
+                    CLS.modules.embedding_model = quantized_inner_model
+                except Exception:
+                    print("Warning: Failed to quantize classifier")
     PRELOAD_TIMES["classifier"] = time.time() - t2
     CLS_SR = int(getattr(CLS.hparams, "sample_rate", 16000))
     yield

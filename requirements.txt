@@ -7,3 +7,6 @@ fastapi
 uvicorn
 python-multipart
 pyaudio
+onnx 
+onnxruntime-gpu
+tensorrt
