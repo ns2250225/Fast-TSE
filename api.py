@@ -154,7 +154,7 @@ def _separate(yb, num_speakers, normalize=True):
         raise RuntimeError("模型未加载")
     t_sep_start = time.time()
     try:
-        with torch.no_grad():
+        with torch.inference_mode():
             est_sources = model.separate_batch(yb)
             if MAIN_DEVICE == "cuda":
                 try:
@@ -165,7 +165,7 @@ def _separate(yb, num_speakers, normalize=True):
         msg = str(e)
         if ("CUDA" in msg) or ("device-side assert" in msg):
             model = SEP_MODELS.get(str(num_speakers))
-            with torch.no_grad():
+            with torch.inference_mode():
                 est_sources = model.separate_batch(yb.cpu())
         else:
             raise
@@ -198,14 +198,14 @@ def _separate(yb, num_speakers, normalize=True):
 def _match_best(sources, sr, tgt_y, threshold):
     t_match_compute_start = time.time()
     tgt_y_t = torch.tensor(_resample_np(tgt_y, sr, CLS_SR)).unsqueeze(0).to(MATCH_DEVICE)
-    with torch.no_grad():
+    with torch.inference_mode():
         tgt_emb = CLS.encode_batch(tgt_y_t).detach().cpu().float().view(-1)
     sims = []
     for i in range(int(sources.shape[0])):
         y = sources[i]
         y_t = y.unsqueeze(0)
         y_rs = _resample_torch(y_t, sr, CLS_SR).to(MATCH_DEVICE)
-        with torch.no_grad():
+        with torch.inference_mode():
             emb = CLS.encode_batch(y_rs).detach().cpu().float().view(-1)
         d = torch.clamp(emb.norm() * tgt_emb.norm(), min=1e-8)
         s = torch.dot(emb, tgt_emb) / d
