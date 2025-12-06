@@ -2,15 +2,92 @@ import torch
 import speechbrain
 from speechbrain.inference.speaker import EncoderClassifier
 import os
+from huggingface_hub import snapshot_download
+import pathlib
+import shutil
+import urllib.request
+import huggingface_hub
+import speechbrain.utils.fetching as sb_fetch
+
+def _fetch_copy(
+    filename,
+    source,
+    savedir="./pretrained_model_checkpoints",
+    overwrite=False,
+    save_filename=None,
+    use_auth_token=False,
+    revision=None,
+    huggingface_cache_dir=None,
+):
+    if save_filename is None:
+        save_filename = filename
+    savedir = pathlib.Path(savedir)
+    savedir.mkdir(parents=True, exist_ok=True)
+    fetch_from = None
+    if isinstance(source, sb_fetch.FetchSource):
+        fetch_from, source = source
+    sourcefile = f"{source}/{filename}"
+    destination = savedir / save_filename
+    if destination.exists() and not overwrite:
+        return destination
+    if pathlib.Path(source).is_dir() and fetch_from not in [
+        sb_fetch.FetchFrom.HUGGING_FACE,
+        sb_fetch.FetchFrom.URI,
+    ]:
+        sourcepath = pathlib.Path(sourcefile).absolute()
+        sb_fetch._missing_ok_unlink(destination)
+        shutil.copyfile(sourcepath, destination)
+        return destination
+    if (
+        str(source).startswith("http:") or str(source).startswith("https:")
+    ) or fetch_from is sb_fetch.FetchFrom.URI:
+        urllib.request.urlretrieve(sourcefile, destination)
+    else:
+        try:
+            fetched_file = huggingface_hub.hf_hub_download(
+                repo_id=source,
+                filename=filename,
+                use_auth_token=use_auth_token,
+                revision=revision,
+                cache_dir=huggingface_cache_dir,
+            )
+        except Exception as e:
+            raise ValueError("File not found on HF hub") from e
+        sourcepath = pathlib.Path(fetched_file).absolute()
+        sb_fetch._missing_ok_unlink(destination)
+        shutil.copyfile(sourcepath, destination)
+    return destination
+
+sb_fetch.fetch = _fetch_copy
+import speechbrain.inference.interfaces as sb_int
+import speechbrain.utils.parameter_transfer as sb_pt
+sb_int.fetch = _fetch_copy
+sb_pt.fetch = _fetch_copy
 
 def export_ecapa_to_onnx(output_path="ecapa_voxceleb.onnx"):
     print(">>> 1. Loading Pretrained Model from SpeechBrain...")
     # 加载预训练模型
     # source 会自动从 HuggingFace 下载
-    classifier = EncoderClassifier.from_hparams(
-        source="speechbrain/spkrec-ecapa-voxceleb", 
-        savedir="pretrained_models/spkrec-ecapa-voxceleb"
-    )
+    savedir = "pretrained_models/spkrec-ecapa-voxceleb"
+    try:
+        classifier = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir=savedir,
+        )
+    except OSError as e:
+        if getattr(e, "winerror", None) == 1314:
+            os.makedirs(savedir, exist_ok=True)
+            snapshot_download(
+                repo_id="speechbrain/spkrec-ecapa-voxceleb",
+                local_dir=savedir,
+                local_dir_use_symlinks=False,
+            )
+            classifier = EncoderClassifier.from_hparams(
+                source=savedir,
+                savedir=savedir,
+            )
+        else:
+            raise
     
     # 获取核心模型组件
     # [...](asc_slot://start-slot-4)这里的 embedding_model 是 ECAPA-TDNN 网络

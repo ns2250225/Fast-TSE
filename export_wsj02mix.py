@@ -2,6 +2,67 @@ import torch
 import torch.nn as nn
 from speechbrain.inference.separation import SepformerSeparation
 import os
+from huggingface_hub import snapshot_download
+import pathlib
+import shutil
+import urllib.request
+import huggingface_hub
+import speechbrain.utils.fetching as sb_fetch
+import speechbrain.inference.interfaces as sb_int
+import speechbrain.utils.parameter_transfer as sb_pt
+
+def _fetch_copy(
+    filename,
+    source,
+    savedir="./pretrained_model_checkpoints",
+    overwrite=False,
+    save_filename=None,
+    use_auth_token=False,
+    revision=None,
+    huggingface_cache_dir=None,
+):
+    if save_filename is None:
+        save_filename = filename
+    savedir = pathlib.Path(savedir)
+    savedir.mkdir(parents=True, exist_ok=True)
+    fetch_from = None
+    if isinstance(source, sb_fetch.FetchSource):
+        fetch_from, source = source
+    sourcefile = f"{source}/{filename}"
+    destination = savedir / save_filename
+    if destination.exists() and not overwrite:
+        return destination
+    if pathlib.Path(source).is_dir() and fetch_from not in [
+        sb_fetch.FetchFrom.HUGGING_FACE,
+        sb_fetch.FetchFrom.URI,
+    ]:
+        sourcepath = pathlib.Path(sourcefile).absolute()
+        sb_fetch._missing_ok_unlink(destination)
+        shutil.copyfile(sourcepath, destination)
+        return destination
+    if (
+        str(source).startswith("http:") or str(source).startswith("https:")
+    ) or fetch_from is sb_fetch.FetchFrom.URI:
+        urllib.request.urlretrieve(sourcefile, destination)
+    else:
+        try:
+            fetched_file = huggingface_hub.hf_hub_download(
+                repo_id=source,
+                filename=filename,
+                use_auth_token=use_auth_token,
+                revision=revision,
+                cache_dir=huggingface_cache_dir,
+            )
+        except Exception as e:
+            raise ValueError("File not found on HF hub") from e
+        sourcepath = pathlib.Path(fetched_file).absolute()
+        sb_fetch._missing_ok_unlink(destination)
+        shutil.copyfile(sourcepath, destination)
+    return destination
+
+sb_fetch.fetch = _fetch_copy
+sb_int.fetch = _fetch_copy
+sb_pt.fetch = _fetch_copy
 
 # ==========================================
 # 1. 更加健壮的模型包装器
@@ -75,10 +136,26 @@ def export_onnx():
     onnx_path = "sepformer_wsj02mix.onnx"
     
     print(f"--- 正在加载模型: {model_source} ---")
-    sb_model = SepformerSeparation.from_hparams(
-        source=model_source,
-        savedir="pretrained_models/sepformer-wsj02mix"
-    )
+    savedir = "pretrained_models/sepformer-wsj02mix"
+    try:
+        sb_model = SepformerSeparation.from_hparams(
+            source=model_source,
+            savedir=savedir,
+        )
+    except OSError as e:
+        if getattr(e, "winerror", None) == 1314:
+            os.makedirs(savedir, exist_ok=True)
+            snapshot_download(
+                repo_id=model_source,
+                local_dir=savedir,
+                local_dir_use_symlinks=False,
+            )
+            sb_model = SepformerSeparation.from_hparams(
+                source=savedir,
+                savedir=savedir,
+            )
+        else:
+            raise
     
     model_wrapper = SepFormerWrapper(sb_model)
     model_wrapper.eval()
