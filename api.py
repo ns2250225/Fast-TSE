@@ -50,6 +50,10 @@ ENABLE_ONNX = False
 FORCE_ONNX_CPU = False
 ONNX_DIR = os.path.join(os.path.dirname(__file__), "onnx")
 
+# 自动检测物理核心数
+NUM_THREADS = 16
+print(f"Using {NUM_THREADS} threads for ONNX inference")
+
 # ============================================================
 
 def _is_torch_tensor(x):
@@ -214,7 +218,7 @@ class OnnxSepformer:
                     path = path_int8
                     
                 # CPU 优化配置
-                sess_options.intra_op_num_threads = 4  # 物理核心数
+                sess_options.intra_op_num_threads = NUM_THREADS
                 sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
                 sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
                 
@@ -338,7 +342,7 @@ class OnnxClassifier:
                 elif os.path.exists(path_int8):
                     path = path_int8
                     
-                sess_options.intra_op_num_threads = 4 
+                sess_options.intra_op_num_threads = NUM_THREADS
                 sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
                 sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
                 
@@ -714,7 +718,7 @@ def _separate(yb, num_speakers, normalize=True):
     return sources, order, t_sep_end - t_sep_start
 
 
-def _match_best(sources, sr, tgt_y, threshold):
+def _match_best(sources, sources_sr, tgt_y, tgt_sr, threshold):
     t_match_compute_start = time.time()
     
     # ----------------------------------------------------------------
@@ -725,13 +729,13 @@ def _match_best(sources, sr, tgt_y, threshold):
     # 直接将 numpy 转为 Tensor 并移至设备
     tgt_y_t = torch.from_numpy(tgt_y).unsqueeze(0).to(MATCH_DEVICE).float()
     
-    # 重采样 Target
-    if sr != CLS_SR:
+    # 重采样 Target (直接从 tgt_sr -> CLS_SR)
+    if tgt_sr != CLS_SR:
         try:
-            tgt_y_t = torchaudio.functional.resample(tgt_y_t, sr, CLS_SR)
+            tgt_y_t = torchaudio.functional.resample(tgt_y_t, tgt_sr, CLS_SR)
         except Exception:
              # 回退：如果 GPU 重采样失败，使用原逻辑
-             tgt_y_np = _resample_np(tgt_y, sr, CLS_SR)
+             tgt_y_np = _resample_np(tgt_y, tgt_sr, CLS_SR)
              tgt_y_t = torch.from_numpy(tgt_y_np).unsqueeze(0).to(MATCH_DEVICE).float()
              
     with torch.inference_mode():
@@ -743,10 +747,10 @@ def _match_best(sources, sr, tgt_y, threshold):
     sources = sources.to(MATCH_DEVICE) # 如果设备不同则迁移，通常相同
     
     # 批量重采样 (Batch Resample)
-    if sr != CLS_SR:
+    if sources_sr != CLS_SR:
         try:
             # torchaudio 支持 (..., Time) 形状，会自动处理 Batch 维度
-            sources_rs = torchaudio.functional.resample(sources, sr, CLS_SR)
+            sources_rs = torchaudio.functional.resample(sources, sources_sr, CLS_SR)
         except Exception:
             # 回退：循环处理
             sources_rs_list = []
@@ -754,11 +758,11 @@ def _match_best(sources, sr, tgt_y, threshold):
                  # 单个处理
                  s_item = sources[i].unsqueeze(0)
                  try:
-                     s_rs = torchaudio.functional.resample(s_item, sr, CLS_SR)
+                     s_rs = torchaudio.functional.resample(s_item, sources_sr, CLS_SR)
                  except:
                      # 极端回退
                      s_np = s_item.cpu().numpy()
-                     s_np = _resample_np(s_np.squeeze(), sr, CLS_SR)
+                     s_np = _resample_np(s_np.squeeze(), sources_sr, CLS_SR)
                      s_rs = torch.from_numpy(s_np).unsqueeze(0).to(MATCH_DEVICE)
                  sources_rs_list.append(s_rs)
             sources_rs = torch.cat(sources_rs_list, dim=0)
@@ -801,10 +805,18 @@ async def separate_match(
     target_bytes = await target.read()
     mix_y, mix_sr = _load_audio_mono_bytes(mixed_bytes)
     tgt_y, tgt_sr = _load_audio_mono_bytes(target_bytes)
-    mix_rs = _resample_np(mix_y, mix_sr, SEP_SR)
-    x = torch.tensor(mix_rs).unsqueeze(0).to(MAIN_DEVICE)
+    
+    # ----------------------------------------------------------------
+    # 优化: 使用 torchaudio 重采样 Mix，避免 numpy 插值
+    # ----------------------------------------------------------------
+    mix_t = torch.from_numpy(mix_y).float()
+    mix_rs_t = _resample_torch(mix_t, mix_sr, SEP_SR)
+    x = mix_rs_t.unsqueeze(0).to(MAIN_DEVICE)
+    
     sources, order, t_sep = _separate(x, num_speakers, normalize=normalize)
-    best_idx, sims, t_match = _match_best(sources, SEP_SR, _resample_np(tgt_y, tgt_sr, SEP_SR), match_threshold)
+    
+    # 优化: 直接传递 tgt_sr，在内部一次性重采样到 CLS_SR
+    best_idx, sims, t_match = _match_best(sources, SEP_SR, tgt_y, tgt_sr, match_threshold)
     
     if best_idx is None:
         return JSONResponse(content={"code": -1, "message": "没有目标人声音"})
@@ -847,10 +859,14 @@ async def separate_match_wav(
     target_bytes = await target.read()
     mix_y, mix_sr = _load_audio_mono_bytes(mixed_bytes)
     tgt_y, tgt_sr = _load_audio_mono_bytes(target_bytes)
-    mix_rs = _resample_np(mix_y, mix_sr, SEP_SR)
-    x = torch.tensor(mix_rs).unsqueeze(0).to(MAIN_DEVICE)
+    
+    mix_t = torch.from_numpy(mix_y).float()
+    mix_rs_t = _resample_torch(mix_t, mix_sr, SEP_SR)
+    x = mix_rs_t.unsqueeze(0).to(MAIN_DEVICE)
+    
     sources, order, t_sep = _separate(x, num_speakers, normalize=normalize)
-    best_idx, sims, t_match = _match_best(sources, SEP_SR, _resample_np(tgt_y, tgt_sr, SEP_SR), match_threshold)
+    
+    best_idx, sims, t_match = _match_best(sources, SEP_SR, tgt_y, tgt_sr, match_threshold)
     
     if best_idx is None:
         return JSONResponse(content={"code": -1, "message": "没有目标人声音"})
