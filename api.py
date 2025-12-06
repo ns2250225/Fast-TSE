@@ -50,7 +50,7 @@ ENABLE_ONNX = False
 FORCE_ONNX_CPU = False
 ONNX_DIR = os.path.join(os.path.dirname(__file__), "onnx")
 
-# 自动检测物理核心数
+# 物理核心数，用于 ONNX 推理加速，具体数值得自己试试，太大也会变慢，要适中
 NUM_THREADS = 16
 print(f"Using {NUM_THREADS} threads for ONNX inference")
 
