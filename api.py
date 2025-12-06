@@ -17,6 +17,7 @@ import soundfile as sf
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse, Response
+import warnings
 try:
     from speechbrain.inference import SepformerSeparation, EncoderClassifier
 except ImportError:
@@ -26,6 +27,11 @@ try:
     import onnxruntime as ort
 except ImportError:
     ort = None
+
+try:
+    from torchcodec.decoders import AudioDecoder
+except Exception:
+    AudioDecoder = None
 
 
 def _is_torch_tensor(x):
@@ -45,10 +51,32 @@ def _load_audio_mono_bytes(b):
     except Exception:
         pass
     try:
-        y, sr = torchaudio.load(io.BytesIO(b))
-        if y.shape[0] > 1:
-            y = y.mean(dim=0)
-        y = y.detach().cpu().numpy().astype("float32")
+        if AudioDecoder is not None:
+            dec = AudioDecoder(src=io.BytesIO(b))
+            y_dec, sr = dec.decode()
+            if _is_torch_tensor(y_dec):
+                y_t = y_dec
+                if y_t.dim() == 2 and y_t.shape[0] > 1:
+                    y_t = y_t.mean(dim=0)
+                y = y_t.detach().cpu().numpy().astype("float32")
+            else:
+                y_np = np.array(y_dec)
+                if y_np.ndim == 2:
+                    if y_np.shape[0] > 1:
+                        y_np = y_np.mean(axis=0)
+                    else:
+                        y_np = y_np.mean(axis=1)
+                y = y_np.astype(np.float32)
+            return y, int(sr)
+    except Exception:
+        pass
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
+            y_t, sr = torchaudio.load(io.BytesIO(b))
+        if y_t.shape[0] > 1:
+            y_t = y_t.mean(dim=0)
+        y = y_t.detach().cpu().numpy().astype("float32")
         return y, int(sr)
     except Exception:
         pass
@@ -82,13 +110,6 @@ def _wav_bytes(y, sr):
         y_np = y.detach().cpu().numpy() if _is_torch_tensor(y) else y
         bio = io.BytesIO()
         sf.write(bio, y_np.astype(np.float32), sr, format="WAV")
-        return bio.getvalue()
-    except Exception:
-        pass
-    try:
-        bio = io.BytesIO()
-        y_t = y.detach().cpu().unsqueeze(0) if _is_torch_tensor(y) else torch.tensor(y).unsqueeze(0)
-        torchaudio.save(bio, y_t, sr, format="wav")
         return bio.getvalue()
     except Exception:
         pass

@@ -1,4 +1,5 @@
 torchaudio==2.8.0
+torchcodec
 soundfile
 numpy<2.0
 speechbrain==1.0.0
