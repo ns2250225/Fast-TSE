@@ -7,5 +7,5 @@ fastapi
 uvicorn
 python-multipart
 pyaudio
-onnx 
+onnx==1.14.0
 onnxruntime-gpu==1.16.3
