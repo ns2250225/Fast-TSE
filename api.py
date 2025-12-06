@@ -627,49 +627,52 @@ async def lifespan(app: FastAPI):
     CLS_SR = int(getattr(CLS.hparams, "sample_rate", 16000))
 
     # Run dummy inference for warmup
-    print("Warming up models...")
-    
-    # Warmup separation models
-    dummy_input = torch.randn(1, 16000).to(MAIN_DEVICE)
-    
-    # Check if model is FP16 and cast dummy input accordingly
-    # For ONNX models, we need to check the underlying session or path
-    if ENABLE_ONNX:
-        for key, model in SEP_MODELS.items():
-            try:
-                # Check if this specific model instance uses an FP16 ONNX file
-                is_fp16 = hasattr(model, 'path') and model.path.endswith("_fp16.onnx")
-                
-                current_input = dummy_input.clone()
-                if is_fp16:
-                    current_input = current_input.half()
-                
-                model.separate_batch(current_input)
-            except Exception as e:
-                print(f"Warmup failed for sepformer_{key}: {e}")
-    else:
-        # PyTorch models usually handle autocast or explicit types
-        for key, model in SEP_MODELS.items():
-            try:
-                model.separate_batch(dummy_input)
-            except Exception as e:
-                print(f"Warmup failed for sepformer_{key}: {e}")
+    if ENABLE_ONNX or FORCE_ONNX_CPU:
+        print("Warming up models...")
+        
+        # Warmup separation models
+        dummy_input = torch.randn(1, 16000).to(MAIN_DEVICE)
+        
+        # Check if model is FP16 and cast dummy input accordingly
+        # For ONNX models, we need to check the underlying session or path
+        if ENABLE_ONNX:
+            for key, model in SEP_MODELS.items():
+                try:
+                    # Check if this specific model instance uses an FP16 ONNX file
+                    is_fp16 = hasattr(model, 'path') and model.path.endswith("_fp16.onnx")
+                    
+                    current_input = dummy_input.clone()
+                    if is_fp16:
+                        current_input = current_input.half()
+                    
+                    model.separate_batch(current_input)
+                except Exception as e:
+                    print(f"Warmup failed for sepformer_{key}: {e}")
+        else:
+            # PyTorch models usually handle autocast or explicit types
+            for key, model in SEP_MODELS.items():
+                try:
+                    model.separate_batch(dummy_input)
+                except Exception as e:
+                    print(f"Warmup failed for sepformer_{key}: {e}")
 
-    # Warmup classifier
-    if CLS is not None:
-        dummy_wavs = torch.randn(1, 16000).to(MATCH_DEVICE)
-        try:
-            # Check if classifier is FP16 ONNX
-            is_fp16 = ENABLE_ONNX and hasattr(CLS, 'path') and CLS.path.endswith("_fp16.onnx")
-            
-            if is_fp16:
-                dummy_wavs = dummy_wavs.half()
+        # Warmup classifier
+        if CLS is not None:
+            dummy_wavs = torch.randn(1, 16000).to(MATCH_DEVICE)
+            try:
+                # Check if classifier is FP16 ONNX
+                is_fp16 = ENABLE_ONNX and hasattr(CLS, 'path') and CLS.path.endswith("_fp16.onnx")
                 
-            CLS.encode_batch(dummy_wavs)
-        except Exception as e:
-            print(f"Warmup failed for classifier: {e}")
-            
-    print("Models warmed up!")
+                if is_fp16:
+                    dummy_wavs = dummy_wavs.half()
+                    
+                CLS.encode_batch(dummy_wavs)
+            except Exception as e:
+                print(f"Warmup failed for classifier: {e}")
+                
+        print("Models warmed up!")
+    else:
+        print("Warmup skipped by config.")
     
     yield
     
