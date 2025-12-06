@@ -34,6 +34,24 @@ except Exception:
     AudioDecoder = None
 
 
+# ===========  配置区域  ==============
+SEP_MODELS = {}
+CLS = None
+PRELOAD_TIMES = {
+    "sepformer_2": 0.0,
+    "sepformer_3": 0.0,
+    "classifier": 0.0,
+}
+SEP_SR = 16000
+CLS_SR = 16000
+MAIN_DEVICE = "cpu"
+MATCH_DEVICE = "cpu"
+ENABLE_ONNX = False
+FORCE_ONNX_CPU = False
+ONNX_DIR = os.path.join(os.path.dirname(__file__), "onnx")
+
+# ============================================================
+
 def _is_torch_tensor(x):
     try:
         return isinstance(x, torch.Tensor)
@@ -125,21 +143,6 @@ def _wav_bytes(y, sr):
     wf.close()
     return bio.getvalue()
 
-
-SEP_MODELS = {}
-CLS = None
-PRELOAD_TIMES = {
-    "sepformer_2": 0.0,
-    "sepformer_3": 0.0,
-    "classifier": 0.0,
-}
-SEP_SR = 16000
-CLS_SR = 16000
-MAIN_DEVICE = "cpu"
-MATCH_DEVICE = "cpu"
-ENABLE_ONNX = False
-FORCE_ONNX_CPU = False
-ONNX_DIR = os.path.join(os.path.dirname(__file__), "onnx")
 
 
 class RedirectStream(object):
