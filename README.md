@@ -156,10 +156,12 @@ curl -X POST \
 
 ## 项目结构
 - `sp.py`：命令行分离与目标匹配脚本
-- `api.py`：FastAPI 服务，提供 JSON 与字节流端点
+- `api.py`：FastAPI 的混合声音提取声纹人声服务，提供 JSON 与字节流端点
+- `api_power.py`：FastAPI 的混合声音提取声音能量最大人声服务，提供字节流端点
 - `quantize.py`: ONNX 模型量化脚本
+- `export_*.py`: 将Pytorch模型导出为ONNX模型脚本
 - `requirements.txt`：依赖列表
-- `onnx/`: 存放 ONNX 模型文件
+- `onnx/`: 存放 ONNX 模型文件目录
 
 ## 许可
 此项目用于演示/实验用途。
