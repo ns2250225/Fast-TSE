@@ -54,7 +54,8 @@ python sp.py mixed.wav -n 2 -t target.wav --device cpu
 - `--output_prefix`：自定义输出文件前缀
 
 ## HTTP 服务
-文件：`api.py`
+文件：`api.py` (从混合音频中提取声纹最匹配的人声)
+文件：`api_power.py` (从混合音频中提取声音能量最大的人声)
 
 ### 配置项 (api.py)
 在 `api.py` 开头部分可以配置以下选项：
